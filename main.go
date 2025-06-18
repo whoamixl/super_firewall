@@ -15,6 +15,28 @@ import (
 	"github.com/gorilla/websocket" // New import for WebSockets
 )
 
+package main
+
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"time"
+
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
+	"github.com/gorilla/websocket"
+)
+
+// DB is the global database connection pool.
+var DB *sql.DB
+
 // AppConfig holds the configuration for our application.
 type AppConfig struct {
 	InterfaceName string
@@ -30,8 +52,19 @@ type LogEntry struct {
 	Time    string `json:"time"`
 }
 
+// BlacklistAPIRequest defines the structure for API requests to manage blacklist entries.
+type BlacklistAPIRequest struct {
+	IPAddress string `json:"ip_address"`
+	Port      int    `json:"port"`
+}
+
 // Global channel to send log entries to WebSocket clients.
 var logChannel = make(chan LogEntry, 100)
+
+// currentBlacklist stores "ip:port" strings for quick lookups.
+var currentBlacklist = make(map[string]struct{})
+var blacklistMutex = sync.RWMutex{} // Mutex to protect currentBlacklist
+
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool {
 		// Allow all origins for development. In production, restrict this.
@@ -59,6 +92,83 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Println("WebSocket client disconnected.")
+}
+
+// getBlacklistHandler handles GET requests to /api/blacklist.
+func getBlacklistHandler(w http.ResponseWriter, r *http.Request) {
+	entries, err := GetBlacklistEntries(DB)
+	if err != nil {
+		log.Printf("Error getting blacklist entries: %v", err)
+		http.Error(w, "Failed to retrieve blacklist", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(entries); err != nil {
+		log.Printf("Error encoding blacklist entries to JSON: %v", err)
+		http.Error(w, "Failed to encode blacklist to JSON", http.StatusInternalServerError)
+	}
+}
+
+// addBlacklistHandler handles POST requests to /api/blacklist.
+func addBlacklistHandler(w http.ResponseWriter, r *http.Request) {
+	var req BlacklistAPIRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if req.IPAddress == "" || req.Port == 0 {
+		http.Error(w, "IP address and port are required", http.StatusBadRequest)
+		return
+	}
+
+	err := AddBlacklistEntry(DB, req.IPAddress, req.Port)
+	if err != nil {
+		// TODO: Check for unique constraint violation specifically if possible
+		log.Printf("Error adding blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
+		http.Error(w, "Failed to add blacklist entry", http.StatusInternalServerError)
+		return
+	}
+
+	key := fmt.Sprintf("%s:%d", req.IPAddress, req.Port)
+	blacklistMutex.Lock()
+	currentBlacklist[key] = struct{}{}
+	blacklistMutex.Unlock()
+
+	logToClients("info", "Added %s to blacklist via API", key)
+	w.WriteHeader(http.StatusCreated)
+}
+
+// removeBlacklistHandler handles DELETE requests to /api/blacklist.
+func removeBlacklistHandler(w http.ResponseWriter, r *http.Request) {
+	var req BlacklistAPIRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if req.IPAddress == "" || req.Port == 0 {
+		http.Error(w, "IP address and port are required", http.StatusBadRequest)
+		return
+	}
+
+	err := RemoveBlacklistEntry(DB, req.IPAddress, req.Port)
+	if err != nil {
+		log.Printf("Error removing blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
+		http.Error(w, "Failed to remove blacklist entry", http.StatusInternalServerError)
+		return
+	}
+
+	key := fmt.Sprintf("%s:%d", req.IPAddress, req.Port)
+	blacklistMutex.Lock()
+	delete(currentBlacklist, key)
+	blacklistMutex.Unlock()
+
+	logToClients("info", "Removed %s from blacklist via API", key)
+	w.WriteHeader(http.StatusOK) // Or http.StatusNoContent
 }
 
 // logToClients sends a log entry to the global log channel.
@@ -206,6 +316,31 @@ func listInterfaces() {
 }
 
 func main() {
+	// --- Initialize Database ---
+	var err error // Declare err here to avoid shadowing DB within the if block
+	DB, err = InitDB("blacklist.db")
+	if err != nil {
+		log.Fatalf("Failed to initialize database: %v", err)
+	}
+	// defer DB.Close() // Defer close in main or where appropriate if DB is truly global and long-lived
+
+	err = CreateBlacklistTable(DB)
+	if err != nil {
+		log.Fatalf("Failed to create blacklist table: %v", err)
+	}
+	log.Println("Database initialized and blacklist table created successfully.")
+
+	// Load blacklist entries
+	entries, err := GetBlacklistEntries(DB)
+	if err != nil {
+		log.Fatalf("Failed to get blacklist entries: %v", err)
+	}
+	for _, entry := range entries {
+		key := fmt.Sprintf("%s:%d", entry.IPAddress, entry.Port)
+		currentBlacklist[key] = struct{}{}
+	}
+	log.Printf("Loaded %d entries into the blacklist.", len(currentBlacklist))
+
 	listInterfaces()
 	// --- 1. Configuration and Setup ---
 	//interfaceName := flag.String("i", "", "Network interface name to listen on")
@@ -229,10 +364,25 @@ func main() {
 	go func() {
 		defer wg.Done()
 		http.HandleFunc("/ws", wsHandler)
-		log.Println("Starting WebSocket server on :8080/ws")
+
+		// Register API handlers for blacklist management
+		http.HandleFunc("/api/blacklist", func(w http.ResponseWriter, r *http.Request) {
+			switch r.Method {
+			case http.MethodGet:
+				getBlacklistHandler(w, r)
+			case http.MethodPost:
+				addBlacklistHandler(w, r)
+			case http.MethodDelete:
+				removeBlacklistHandler(w, r)
+			default:
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
+		log.Println("Starting WebSocket and API server on :8080")
 		// Serve static files from a 'frontend/dist' directory (create this later)
 		http.Handle("/", http.FileServer(http.Dir("./frontend/dist")))
-		err := http.ListenAndServe(":8080", nil)
+		err := http.ListenAndServe(":8080", nil) // Ensure DB is accessible if handlers need it
 		if err != nil {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
@@ -276,14 +426,24 @@ func main() {
 		ip := ipLayer.(*layers.IPv4)
 		tcp := tcpLayer.(*layers.TCP)
 
-		// Check if the source IP is from an external network
-		if !isInternalIP(ip.SrcIP) {
-			logToClients("intercept", "External SYN detected from %s:%d. Sending RST...", ip.SrcIP, tcp.SrcPort)
-			// Send the RST packet
+		sourceKey := fmt.Sprintf("%s:%d", ip.SrcIP.String(), tcp.SrcPort)
+
+		blacklistMutex.RLock()
+		_, found := currentBlacklist[sourceKey]
+		blacklistMutex.RUnlock()
+
+		// Check if the source IP and port are in the blacklist
+		if found {
+			logToClients("intercept", "Blacklisted SYN detected from %s. Sending RST...", sourceKey)
 			if err := sendRstPacket(handle, eth, ip, tcp); err != nil {
-				logToClients("error", "Failed to send RST packet: %v", err) // Log error to clients
+				logToClients("error", "Failed to send RST packet for blacklisted source %s: %v", sourceKey, err)
 			}
-		} else {
+		} else if !isInternalIP(ip.SrcIP) { // If not blacklisted, check if it's an external IP
+			logToClients("intercept", "External SYN detected from %s:%d. Sending RST...", ip.SrcIP, tcp.SrcPort)
+			if err := sendRstPacket(handle, eth, ip, tcp); err != nil {
+				logToClients("error", "Failed to send RST packet for external source %s:%d: %v", ip.SrcIP, tcp.SrcPort, err)
+			}
+		} else { // If not blacklisted and not external (i.e., internal)
 			logToClients("connect", "Internal SYN detected from %s:%d. Allowing.", ip.SrcIP, tcp.SrcPort)
 		}
 	}
