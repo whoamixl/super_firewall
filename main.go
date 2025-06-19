@@ -40,8 +40,22 @@ type BlacklistAPIRequest struct {
 	Port      int    `json:"port"`
 }
 
+// SelectInterfaceRequest defines the structure for API requests to select a network interface.
+type SelectInterfaceRequest struct {
+	InterfaceName string `json:"interface_name"`
+}
+
 // Global channel to send log entries to WebSocket clients.
 var logChannel = make(chan LogEntry, 100)
+
+// Global variables for packet sniffing management
+var (
+	activeConfig      *AppConfig
+	pcapHandle        *pcap.Handle
+	pcapMutex         sync.Mutex
+	stopSniffing      chan struct{}
+	sniffingWaitGroup sync.WaitGroup
+)
 
 // currentBlacklist stores "ip:port" strings for quick lookups.
 var currentBlacklist = make(map[string]struct{})
@@ -74,6 +88,181 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	log.Println("WebSocket client disconnected.")
+}
+
+// startSniffing initializes and starts the packet sniffing process on the specified interface.
+// It handles stopping any existing sniffing process before starting a new one.
+func startSniffing(interfaceName string) error {
+	pcapMutex.Lock()
+	defer pcapMutex.Unlock()
+
+	// If sniffing is already active, stop it first.
+	if pcapHandle != nil {
+		logToClients("info", "Stopping existing sniffing process on %s...", activeConfig.InterfaceName)
+		if stopSniffing != nil {
+			close(stopSniffing) // Signal the existing goroutine to stop
+		}
+		pcapHandle.Close()      // Close the handle
+		sniffingWaitGroup.Wait() // Wait for the goroutine to finish
+		logToClients("info", "Sniffing process stopped.")
+		pcapHandle = nil
+		activeConfig = nil
+	}
+
+	logToClients("info", "Attempting to start sniffing on interface: %s", interfaceName)
+
+	cfg, err := findInterfaceConfig(interfaceName)
+	if err != nil {
+		logToClients("error", "Failed to find config for interface %s: %v", interfaceName, err)
+		return fmt.Errorf("failed to find config for interface %s: %v", interfaceName, err)
+	}
+	activeConfig = cfg
+
+	// Open the device for capturing
+	handle, err := pcap.OpenLive(activeConfig.InterfaceName, 1600, true, pcap.BlockForever)
+	if err != nil {
+		logToClients("error", "Error opening device %s: %v", activeConfig.InterfaceName, err)
+		activeConfig = nil // Clear config if open fails
+		return fmt.Errorf("error opening device %s: %v", activeConfig.InterfaceName, err)
+	}
+	pcapHandle = handle
+
+	// Set BPF filter
+	// We only want to capture TCP SYN packets destined for our IP.
+	if activeConfig.IPv4Addr == nil {
+		logToClients("error", "No IPv4 address configured for interface %s. Cannot set BPF filter.", activeConfig.InterfaceName)
+		pcapHandle.Close()
+		pcapHandle = nil
+		activeConfig = nil
+		return fmt.Errorf("no IPv4 address for interface %s, cannot set BPF filter", activeConfig.InterfaceName)
+	}
+	filter := fmt.Sprintf("tcp[tcpflags] & tcp-syn != 0 and not tcp[tcpflags] & tcp-ack != 0 and dst host %s", activeConfig.IPv4Addr.String())
+	if err := pcapHandle.SetBPFFilter(filter); err != nil {
+		logToClients("error", "Error setting BPF filter '%s': %v", filter, err)
+		pcapHandle.Close()
+		pcapHandle = nil
+		activeConfig = nil
+		return fmt.Errorf("error setting BPF filter: %v", err)
+	}
+
+	stopSniffing = make(chan struct{})
+	sniffingWaitGroup.Add(1)
+
+	go func() {
+		defer sniffingWaitGroup.Done()
+		defer pcapHandle.Close() // Ensure handle is closed when goroutine exits
+
+		logToClients("info", "Listening on %s with filter: \"%s\"", activeConfig.InterfaceName, filter)
+		packetSource := gopacket.NewPacketSource(pcapHandle, pcapHandle.LinkType())
+		for {
+			select {
+			case <-stopSniffing:
+				logToClients("info", "Sniffing goroutine on %s received stop signal.", activeConfig.InterfaceName)
+				return
+			case packet, ok := <-packetSource.Packets():
+				if !ok {
+					logToClients("info", "Packet source closed for %s.", activeConfig.InterfaceName)
+					return
+				}
+				// Process packet
+				ethLayer := packet.Layer(layers.LayerTypeEthernet)
+				ipLayer := packet.Layer(layers.LayerTypeIPv4)
+				tcpLayer := packet.Layer(layers.LayerTypeTCP)
+
+				if ethLayer == nil || ipLayer == nil || tcpLayer == nil {
+					continue // Not a valid TCP/IP packet
+				}
+
+				eth := ethLayer.(*layers.Ethernet)
+				ip := ipLayer.(*layers.IPv4)
+				tcp := tcpLayer.(*layers.TCP)
+
+				sourceKey := fmt.Sprintf("%s:%d", ip.SrcIP.String(), tcp.SrcPort)
+
+				blacklistMutex.RLock()
+				_, found := currentBlacklist[sourceKey]
+				blacklistMutex.RUnlock()
+
+				if found {
+					logToClients("intercept", "Blacklisted SYN from %s on %s. Sending RST...", sourceKey, activeConfig.InterfaceName)
+					if err := sendRstPacket(pcapHandle, eth, ip, tcp); err != nil {
+						logToClients("error", "Fail to send RST to blacklisted %s: %v", sourceKey, err)
+					}
+				} else if !isInternalIP(ip.SrcIP) {
+					logToClients("intercept", "External SYN from %s:%d on %s. Sending RST...", ip.SrcIP, tcp.SrcPort, activeConfig.InterfaceName)
+					if err := sendRstPacket(pcapHandle, eth, ip, tcp); err != nil {
+						logToClients("error", "Fail to send RST to external %s:%d: %v", ip.SrcIP, tcp.SrcPort, err)
+					}
+				} else {
+					logToClients("connect", "Internal SYN from %s:%d on %s. Allowing.", ip.SrcIP, tcp.SrcPort, activeConfig.InterfaceName)
+				}
+			}
+		}
+	}()
+
+	return nil
+}
+
+// InterfaceInfo holds information about a network interface.
+type InterfaceInfo struct {
+	Name      string   `json:"name"`
+	Addresses []string `json:"addresses"`
+}
+
+// getInterfacesHandler handles GET requests to /api/interfaces.
+func getInterfacesHandler(w http.ResponseWriter, r *http.Request) {
+	devices, err := pcap.FindAllDevs()
+	if err != nil {
+		log.Printf("Error finding devices: %v", err)
+		http.Error(w, "Failed to find network interfaces", http.StatusInternalServerError)
+		return
+	}
+
+	var interfaces []InterfaceInfo
+	for _, device := range devices {
+		var addresses []string
+		for _, address := range device.Addresses {
+			addresses = append(addresses, address.IP.String())
+		}
+		interfaces = append(interfaces, InterfaceInfo{Name: device.Name, Addresses: addresses})
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err = json.NewEncoder(w).Encode(interfaces)
+	if err != nil {
+		log.Printf("Error encoding interfaces to JSON: %v", err)
+		http.Error(w, "Failed to encode interfaces to JSON", http.StatusInternalServerError)
+		return
+	}
+}
+
+// selectInterfaceHandler handles POST requests to /api/select-interface.
+func selectInterfaceHandler(w http.ResponseWriter, r *http.Request) {
+	var req SelectInterfaceRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if req.InterfaceName == "" {
+		http.Error(w, "Interface name is required", http.StatusBadRequest)
+		return
+	}
+
+	logToClients("info", "API call to select interface: %s", req.InterfaceName)
+
+	// Attempt to start sniffing on the new interface.
+	// startSniffing handles stopping any previous sniffing.
+	if err := startSniffing(req.InterfaceName); err != nil {
+		logToClients("error", "Failed to start sniffing on %s: %v", req.InterfaceName, err)
+		http.Error(w, fmt.Sprintf("Failed to start sniffing on %s: %v", req.InterfaceName, err), http.StatusInternalServerError)
+		return
+	}
+
+	logToClients("info", "Successfully selected and started sniffing on interface: %s", req.InterfaceName)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Successfully selected interface: " + req.InterfaceName})
 }
 
 // getBlacklistHandler handles GET requests to /api/blacklist.
@@ -280,6 +469,7 @@ func findInterfaceConfig(name string) (*AppConfig, error) {
 	return nil, fmt.Errorf("interface %s not found", name)
 }
 
+/*
 // listInterfaces prints all available network interfaces.
 func listInterfaces() {
 	devices, err := pcap.FindAllDevs()
@@ -296,6 +486,7 @@ func listInterfaces() {
 	fmt.Println("\nPlease choose an interface and run again with the -i flag.")
 	fmt.Printf("Example: %s -i <interface_name>\n", os.Args[0])
 }
+*/
 
 func main() {
 	// --- Initialize Database ---
@@ -323,24 +514,12 @@ func main() {
 	}
 	log.Printf("Loaded %d entries into the blacklist.", len(currentBlacklist))
 
-	listInterfaces()
-	// --- 1. Configuration and Setup ---
-	//interfaceName := flag.String("i", "", "Network interface name to listen on")
-	//flag.Parse()
-	interfaceName := "以太网"
+	// Sniffing is no longer started automatically here.
+	// It will be started via the /api/select-interface endpoint.
+	// Old command-line interface selection and hardcoded values have been removed.
+	log.Println("Application initialized. Select a network interface via the API to start sniffing.")
 
-	if interfaceName == "" {
-		listInterfaces()
-		os.Exit(1)
-	}
-
-	config, err := findInterfaceConfig(interfaceName)
-	config.InterfaceName = "\\Device\\NPF_{31806068-E5B1-4FD3-8045-57E7F4A28738}"
-	if err != nil {
-		log.Fatalf("Error configuring application: %v", err)
-	}
-
-	// --- Start WebSocket server in a goroutine ---
+	// --- Start WebSocket server and API endpoints in a goroutine ---
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
@@ -361,6 +540,24 @@ func main() {
 			}
 		})
 
+		// Register handler for /api/select-interface
+		http.HandleFunc("/api/select-interface", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				selectInterfaceHandler(w, r)
+			} else {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
+		// Register handler for /api/interfaces
+		http.HandleFunc("/api/interfaces", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				getInterfacesHandler(w, r)
+			} else {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
 		log.Println("Starting WebSocket and API server on :8080")
 		// Serve static files from a 'frontend/dist' directory (create this later)
 		http.Handle("/", http.FileServer(http.Dir("./frontend/dist")))
@@ -369,65 +566,10 @@ func main() {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
 	}()
-	// Wait for the server to start, or handle this more gracefully
-	time.Sleep(1 * time.Second) // Give server a moment to start
 
-	// --- 2. Open PCAP Handle for Live Capture ---
-	// Open the device for capturing, 1600 is a standard snapshot length.
-	// true is for promiscuous mode.
-	handle, err := pcap.OpenLive(config.InterfaceName, 1600, true, pcap.BlockForever)
-	if err != nil {
-		log.Fatalf("Error opening device %s: %v", config.InterfaceName, err)
-	}
-	defer handle.Close()
-
-	// --- 3. Set BPF Filter ---
-	// We only want to capture TCP SYN packets destined for our IP.
-	// "tcp[tcpflags] & tcp-syn != 0" ensures we only get SYN packets.
-	// "and not tcp[tcpflags] & tcp-ack != 0" excludes SYN-ACK packets.
-	filter := fmt.Sprintf("tcp[tcpflags] & tcp-syn != 0 and not tcp[tcpflags] & tcp-ack != 0 and dst host %s", config.IPv4Addr.String())
-	if err := handle.SetBPFFilter(filter); err != nil {
-		log.Fatalf("Error setting BPF filter: %v", err)
-	}
-
-	log.Printf("Listening on %s with filter: \"%s\"", config.InterfaceName, filter)
-
-	// --- 4. Packet Processing Loop ---
-	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	for packet := range packetSource.Packets() {
-		// Extract layers
-		ethLayer := packet.Layer(layers.LayerTypeEthernet)
-		ipLayer := packet.Layer(layers.LayerTypeIPv4)
-		tcpLayer := packet.Layer(layers.LayerTypeTCP)
-
-		if ethLayer == nil || ipLayer == nil || tcpLayer == nil {
-			continue // Not a valid TCP/IP packet
-		}
-
-		eth := ethLayer.(*layers.Ethernet)
-		ip := ipLayer.(*layers.IPv4)
-		tcp := tcpLayer.(*layers.TCP)
-
-		sourceKey := fmt.Sprintf("%s:%d", ip.SrcIP.String(), tcp.SrcPort)
-
-		blacklistMutex.RLock()
-		_, found := currentBlacklist[sourceKey]
-		blacklistMutex.RUnlock()
-
-		// Check if the source IP and port are in the blacklist
-		if found {
-			logToClients("intercept", "Blacklisted SYN detected from %s. Sending RST...", sourceKey)
-			if err := sendRstPacket(handle, eth, ip, tcp); err != nil {
-				logToClients("error", "Failed to send RST packet for blacklisted source %s: %v", sourceKey, err)
-			}
-		} else if !isInternalIP(ip.SrcIP) { // If not blacklisted, check if it's an external IP
-			logToClients("intercept", "External SYN detected from %s:%d. Sending RST...", ip.SrcIP, tcp.SrcPort)
-			if err := sendRstPacket(handle, eth, ip, tcp); err != nil {
-				logToClients("error", "Failed to send RST packet for external source %s:%d: %v", ip.SrcIP, tcp.SrcPort, err)
-			}
-		} else { // If not blacklisted and not external (i.e., internal)
-			logToClients("connect", "Internal SYN detected from %s:%d. Allowing.", ip.SrcIP, tcp.SrcPort)
-		}
-	}
-	wg.Wait() // Keep main goroutine alive until WebSocket server stops (unlikely in this setup)
+	// Keep main goroutine alive until the HTTP server goroutine stops.
+	// If http.ListenAndServe returns (which it ideally shouldn't unless there's a fatal error),
+	// wg.Wait() will allow the program to exit cleanly.
+	wg.Wait()
+	log.Println("HTTP server goroutine finished. Exiting.")
 }

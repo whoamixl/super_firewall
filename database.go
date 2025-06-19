@@ -70,3 +70,16 @@ func GetBlacklistEntries(db *sql.DB) ([]BlacklistEntry, error) {
 	}
 	return entries, nil
 }
+
+// RemoveBlacklistEntry removes an IP address and port from the blacklist.
+func RemoveBlacklistEntry(db *sql.DB, ipAddress string, port int) error {
+	query := "DELETE FROM blacklist WHERE ip_address = ? AND port = ?"
+	stmt, err := db.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(ipAddress, port)
+	return err
+}
