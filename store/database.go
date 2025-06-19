@@ -31,7 +31,7 @@ func CreateBlacklistTable(db *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS blacklist (
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		ip_address TEXT NOT NULL,
-		port INTEGER, // Made port nullable
+		port INTEGER,
 		UNIQUE(ip_address, port)
 	);`
 	_, err := db.Exec(query)
