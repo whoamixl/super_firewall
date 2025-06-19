@@ -11,8 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
-	"strings" // Added for string manipulation
+	"super_firewall/store"
 	"sync"
 	"time"
 )
@@ -163,7 +162,6 @@ func startSniffing(pcapDeviceName string) error {
 			pcapMutex.Unlock()
 		}()
 
-
 		logToClients("info", "Listening on pcap device %s (System: %s) with filter: \"%s\"", activeConfig.PcapDeviceName, activeConfig.SystemInterfaceName, filter)
 		packetSource := gopacket.NewPacketSource(pcapHandle, pcapHandle.LinkType())
 		for {
@@ -250,11 +248,8 @@ func getInterfacesHandler(w http.ResponseWriter, r *http.Request) {
 
 		// Basic filtering: skip if no addresses and not clearly a loopback or "any" type interface.
 		// This helps to present a cleaner list to the user.
-		isLoopback := device.Flags.Has(pcap.IF_LOOPBACK) ||
-		              (strings.Contains(strings.ToLower(displayName), "loopback"))
-		              // Add more specific loopback name checks if needed for certain OS (e.g. "lo0" for macOS)
 
-		if len(addresses) == 0 && !isLoopback && device.Name != "any" {
+		if len(addresses) == 0 && device.Name != "any" {
 			// logToClients("debug", "Skipping interface %s (%s): no addresses and not loopback/any.", device.Name, displayName)
 			continue
 		}
@@ -310,7 +305,7 @@ func selectInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 
 // getBlacklistHandler handles GET requests to /api/blacklist.
 func getBlacklistHandler(w http.ResponseWriter, r *http.Request) {
-	entries, err := GetBlacklistEntries(DB)
+	entries, err := store.GetBlacklistEntries(DB)
 	if err != nil {
 		log.Printf("Error getting blacklist entries: %v", err)
 		http.Error(w, "Failed to retrieve blacklist", http.StatusInternalServerError)
@@ -338,7 +333,7 @@ func addBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := AddBlacklistEntry(DB, req.IPAddress, req.Port)
+	err := store.AddBlacklistEntry(DB, req.IPAddress, req.Port)
 	if err != nil {
 		// TODO: Check for unique constraint violation specifically if possible
 		log.Printf("Error adding blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
@@ -369,7 +364,7 @@ func removeBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := RemoveBlacklistEntry(DB, req.IPAddress, req.Port)
+	err := store.RemoveBlacklistEntry(DB, req.IPAddress, req.Port)
 	if err != nil {
 		log.Printf("Error removing blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
 		http.Error(w, "Failed to remove blacklist entry", http.StatusInternalServerError)
@@ -581,20 +576,20 @@ func listInterfaces() {
 func main() {
 	// --- Initialize Database ---
 	var err error // Declare err here to avoid shadowing DB within the if block
-	DB, err = InitDB("blacklist.db")
+	DB, err = store.InitDB("blacklist.db")
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	// defer DB.Close() // Defer close in main or where appropriate if DB is truly global and long-lived
 
-	err = CreateBlacklistTable(DB)
+	err = store.CreateBlacklistTable(DB)
 	if err != nil {
 		log.Fatalf("Failed to create blacklist table: %v", err)
 	}
 	log.Println("Database initialized and blacklist table created successfully.")
 
 	// Load blacklist entries
-	entries, err := GetBlacklistEntries(DB)
+	entries, err := store.GetBlacklistEntries(DB)
 	if err != nil {
 		log.Fatalf("Failed to get blacklist entries: %v", err)
 	}
