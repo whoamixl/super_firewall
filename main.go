@@ -11,7 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"os"
+	"super_firewall/store"
 	"sync"
 	"time"
 )
@@ -102,7 +102,7 @@ func startSniffing(interfaceName string) error {
 		if stopSniffing != nil {
 			close(stopSniffing) // Signal the existing goroutine to stop
 		}
-		pcapHandle.Close()      // Close the handle
+		pcapHandle.Close()       // Close the handle
 		sniffingWaitGroup.Wait() // Wait for the goroutine to finish
 		logToClients("info", "Sniffing process stopped.")
 		pcapHandle = nil
@@ -111,10 +111,14 @@ func startSniffing(interfaceName string) error {
 
 	logToClients("info", "Attempting to start sniffing on interface: %s", interfaceName)
 
-	cfg, err := findInterfaceConfig(interfaceName)
-	if err != nil {
-		logToClients("error", "Failed to find config for interface %s: %v", interfaceName, err)
-		return fmt.Errorf("failed to find config for interface %s: %v", interfaceName, err)
+	//cfg, err := findInterfaceConfig(interfaceName)
+	//if err != nil {
+	//	logToClients("error", "Failed to find config for interface %s: %v", interfaceName, err)
+	//	return fmt.Errorf("failed to find config for interface %s: %v", interfaceName, err)
+	//}
+	cfg := &AppConfig{
+		InterfaceName: "\\Device\\NPF_{31806068-E5B1-4FD3-8045-57E7F4A28738}",
+		IPv4Addr:      net.ParseIP("192.168.2.193"),
 	}
 	activeConfig = cfg
 
@@ -267,7 +271,7 @@ func selectInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 
 // getBlacklistHandler handles GET requests to /api/blacklist.
 func getBlacklistHandler(w http.ResponseWriter, r *http.Request) {
-	entries, err := GetBlacklistEntries(DB)
+	entries, err := store.GetBlacklistEntries(DB)
 	if err != nil {
 		log.Printf("Error getting blacklist entries: %v", err)
 		http.Error(w, "Failed to retrieve blacklist", http.StatusInternalServerError)
@@ -295,7 +299,7 @@ func addBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := AddBlacklistEntry(DB, req.IPAddress, req.Port)
+	err := store.AddBlacklistEntry(DB, req.IPAddress, req.Port)
 	if err != nil {
 		// TODO: Check for unique constraint violation specifically if possible
 		log.Printf("Error adding blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
@@ -326,7 +330,7 @@ func removeBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	err := RemoveBlacklistEntry(DB, req.IPAddress, req.Port)
+	err := store.RemoveBlacklistEntry(DB, req.IPAddress, req.Port)
 	if err != nil {
 		log.Printf("Error removing blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
 		http.Error(w, "Failed to remove blacklist entry", http.StatusInternalServerError)
@@ -491,20 +495,20 @@ func listInterfaces() {
 func main() {
 	// --- Initialize Database ---
 	var err error // Declare err here to avoid shadowing DB within the if block
-	DB, err = InitDB("blacklist.db")
+	DB, err = store.InitDB("blacklist.db")
 	if err != nil {
 		log.Fatalf("Failed to initialize database: %v", err)
 	}
 	// defer DB.Close() // Defer close in main or where appropriate if DB is truly global and long-lived
 
-	err = CreateBlacklistTable(DB)
+	err = store.CreateBlacklistTable(DB)
 	if err != nil {
 		log.Fatalf("Failed to create blacklist table: %v", err)
 	}
 	log.Println("Database initialized and blacklist table created successfully.")
 
 	// Load blacklist entries
-	entries, err := GetBlacklistEntries(DB)
+	entries, err := store.GetBlacklistEntries(DB)
 	if err != nil {
 		log.Fatalf("Failed to get blacklist entries: %v", err)
 	}
