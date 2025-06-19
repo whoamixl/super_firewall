@@ -7,9 +7,9 @@ import (
 
 // BlacklistEntry represents an entry in the blacklist table.
 type BlacklistEntry struct {
-	ID        int
-	IPAddress string
-	Port      *int // Changed to pointer to handle nullable port
+	ID        int    `json:"id"`
+	IPAddress string `json:"ip_address"`
+	Port      *int   `json:"port"` // Changed to pointer to handle nullable port
 }
 
 // InitDB opens a connection to the SQLite database and pings it.

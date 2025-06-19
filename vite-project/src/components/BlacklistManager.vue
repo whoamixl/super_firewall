@@ -6,11 +6,11 @@
     <form @submit.prevent="addEntry">
       <div>
         <label for="ipAddress">IP Address:</label>
-        <input type="text" id="ipAddress" v.model="newEntry.ip_address" required>
+        <input type="text" id="ipAddress" v-model="newEntry.ip_address" required>
       </div>
       <div>
         <label for="port">Port:</label>
-        <input type="number" id="port" v.model.number="newEntry.port" min="1" max="65535" placeholder="(leave empty for IP-only)">
+        <input type="number" id="port" v-model.number="newEntry.port" min="1" max="65535" placeholder="(leave empty for IP-only)">
       </div>
       <button type="submit">Add to Blacklist</button>
     </form>
