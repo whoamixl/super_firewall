@@ -2,27 +2,19 @@ package main
 
 import (
 	"database/sql"
-	"net"
-)
-package main
-import (
-	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
-	"net"
-	"net/http" // New import for HTTP server
-	"os"
-	"sync" // New import for managing goroutines/concurrency
-	"time"
-
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
 	"github.com/google/gopacket/pcap"
-	"github.com/gorilla/websocket" // New import for WebSockets
+	"github.com/gorilla/websocket"
+	"log"
+	"net"
+	"net/http"
+	"os"
+	"sync"
+	"time"
 )
-
-
 
 // DB is the global database connection pool.
 var DB *sql.DB
