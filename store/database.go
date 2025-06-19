@@ -55,6 +55,66 @@ func AddBlacklistEntry(db *sql.DB, ipAddress string, port *int) error { // port 
 	return err
 }
 
+// CreateActiveInterfacesTable creates the active_interfaces table if it doesn't exist.
+func CreateActiveInterfacesTable(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS active_interfaces (
+		pcap_device_name TEXT PRIMARY KEY NOT NULL
+	);`
+	_, err := db.Exec(query)
+	return err
+}
+
+// AddActiveInterface adds a new pcap_device_name to the active_interfaces table.
+// It uses INSERT OR IGNORE to avoid errors if the interface is already listed.
+func AddActiveInterface(db *sql.DB, pcapDeviceName string) error {
+	query := "INSERT OR IGNORE INTO active_interfaces (pcap_device_name) VALUES (?);"
+	stmt, err := db.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(pcapDeviceName)
+	return err
+}
+
+// RemoveActiveInterface removes a pcap_device_name from the active_interfaces table.
+func RemoveActiveInterface(db *sql.DB, pcapDeviceName string) error {
+	query := "DELETE FROM active_interfaces WHERE pcap_device_name = ?;"
+	stmt, err := db.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(pcapDeviceName)
+	return err
+}
+
+// GetActiveInterfaces retrieves all pcap_device_name entries from the active_interfaces table.
+func GetActiveInterfaces(db *sql.DB) ([]string, error) {
+	query := "SELECT pcap_device_name FROM active_interfaces;"
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var interfaceNames []string
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		interfaceNames = append(interfaceNames, name)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	return interfaceNames, nil
+}
+
 // GetBlacklistEntries retrieves all entries from the blacklist table.
 func GetBlacklistEntries(db *sql.DB) ([]BlacklistEntry, error) {
 	query := "SELECT id, ip_address, port FROM blacklist"

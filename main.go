@@ -51,11 +51,12 @@ var logChannel = make(chan LogEntry, 100)
 
 // Global variables for packet sniffing management
 var (
-	activeConfig      *AppConfig
-	pcapHandle        *pcap.Handle
-	pcapMutex         sync.Mutex
-	stopSniffing      chan struct{}
+	activeConfigs     map[string]*AppConfig
+	pcapHandles       map[string]*pcap.Handle
+	stopSniffingChans map[string]chan struct{}
 	sniffingWaitGroup sync.WaitGroup
+	// activeSniffersMutex protects activeConfigs, pcapHandles, and stopSniffingChans
+	activeSniffersMutex sync.Mutex
 )
 
 // currentBlacklist stores "ip:port" strings for quick lookups.
@@ -92,86 +93,85 @@ func wsHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // startSniffing initializes and starts the packet sniffing process on the specified interface.
-// It handles stopping any existing sniffing process before starting a new one.
+// startSniffing initializes and starts packet sniffing on a specific interface.
 func startSniffing(pcapDeviceName string) error {
-	pcapMutex.Lock()
-	defer pcapMutex.Unlock()
-
-	// If sniffing is already active, stop it first.
-	if pcapHandle != nil {
-		logToClients("info", "Stopping existing sniffing process on pcap device %s (System: %s)...", activeConfig.PcapDeviceName, activeConfig.SystemInterfaceName)
-		if stopSniffing != nil {
-			close(stopSniffing) // Signal the existing goroutine to stop
-		}
-		// pcapHandle.Close() is called by the sniffing goroutine's defer or here if error during setup
-		sniffingWaitGroup.Wait() // Wait for the goroutine to finish
-		logToClients("info", "Sniffing process stopped.")
-		pcapHandle = nil // Explicitly nil out after goroutine is confirmed done.
-		activeConfig = nil
+	activeSniffersMutex.Lock()
+	if _, exists := activeConfigs[pcapDeviceName]; exists {
+		activeSniffersMutex.Unlock()
+		logToClients("info", "Sniffing already active on %s", pcapDeviceName)
+		return fmt.Errorf("sniffing already active on %s", pcapDeviceName)
 	}
-
-	logToClients("info", "Attempting to start sniffing on pcap device: %s", pcapDeviceName)
 
 	cfg, err := findInterfaceConfig(pcapDeviceName)
 	if err != nil {
-		logToClients("error", "Failed to find suitable config for pcap device %s: %v", pcapDeviceName, err)
-		return fmt.Errorf("failed to find suitable config for pcap device %s: %v", pcapDeviceName, err)
+		activeSniffersMutex.Unlock()
+		logToClients("error", "Failed to find config for %s: %v", pcapDeviceName, err)
+		return fmt.Errorf("failed to find config for %s: %v", pcapDeviceName, err)
 	}
-	activeConfig = cfg
 
-	// Open the device for capturing
-	// Use PcapDeviceName for OpenLive
-	handle, err := pcap.OpenLive(activeConfig.PcapDeviceName, 1600, true, pcap.BlockForever)
+	handle, err := pcap.OpenLive(pcapDeviceName, 1600, true, pcap.BlockForever)
 	if err != nil {
-		logToClients("error", "Error opening pcap device %s (System: %s): %v", activeConfig.PcapDeviceName, activeConfig.SystemInterfaceName, err)
-		activeConfig = nil // Clear config if open fails
-		return fmt.Errorf("error opening pcap device %s: %v", activeConfig.PcapDeviceName, err)
-	}
-	pcapHandle = handle // Store the new handle
-
-	// Set BPF filter
-	if activeConfig.IPv4Addr == nil {
-		logToClients("error", "No IPv4 address configured for pcap device %s (System: %s). Cannot set BPF filter.", activeConfig.PcapDeviceName, activeConfig.SystemInterfaceName)
-		pcapHandle.Close() // Close newly opened handle
-		pcapHandle = nil
-		activeConfig = nil
-		return fmt.Errorf("no IPv4 address for pcap device %s, cannot set BPF filter", activeConfig.PcapDeviceName)
-	}
-	filter := fmt.Sprintf("tcp[tcpflags] & tcp-syn != 0 and not tcp[tcpflags] & tcp-ack != 0 and dst host %s", activeConfig.IPv4Addr.String())
-	if err := pcapHandle.SetBPFFilter(filter); err != nil {
-		logToClients("error", "Error setting BPF filter '%s' on %s: %v", filter, activeConfig.PcapDeviceName, err)
-		pcapHandle.Close() // Close newly opened handle
-		pcapHandle = nil
-		activeConfig = nil
-		return fmt.Errorf("error setting BPF filter: %v", err)
+		activeSniffersMutex.Unlock()
+		logToClients("error", "Error opening pcap device %s: %v", pcapDeviceName, err)
+		return fmt.Errorf("error opening pcap device %s: %v", pcapDeviceName, err)
 	}
 
-	stopSniffing = make(chan struct{})
+	if cfg.IPv4Addr == nil {
+		activeSniffersMutex.Unlock()
+		handle.Close() // Close the handle if IPv4 is not available.
+		logToClients("error", "No IPv4 address for %s, cannot set BPF filter.", pcapDeviceName)
+		return fmt.Errorf("no IPv4 address for %s", pcapDeviceName)
+	}
+	filter := fmt.Sprintf("tcp[tcpflags] & tcp-syn != 0 and not tcp[tcpflags] & tcp-ack != 0 and dst host %s", cfg.IPv4Addr.String())
+	if err := handle.SetBPFFilter(filter); err != nil {
+		activeSniffersMutex.Unlock()
+		handle.Close()
+		logToClients("error", "Error setting BPF filter on %s: %v", pcapDeviceName, err)
+		return fmt.Errorf("error setting BPF filter on %s: %v", pcapDeviceName, err)
+	}
+
+	stopChan := make(chan struct{})
+	activeConfigs[pcapDeviceName] = cfg
+	pcapHandles[pcapDeviceName] = handle
+	stopSniffingChans[pcapDeviceName] = stopChan
+
 	sniffingWaitGroup.Add(1)
+	activeSniffersMutex.Unlock()
 
-	go func() {
+	logToClients("info", "Starting sniffing on %s (System: %s, IP: %s)", pcapDeviceName, cfg.SystemInterfaceName, cfg.IPv4Addr)
+
+	go func(devName string, currentHandle *pcap.Handle, currentConfig *AppConfig, currentStopChan chan struct{}) {
 		defer sniffingWaitGroup.Done()
-		// This defer ensures pcapHandle is closed when the sniffing goroutine ends,
-		// either by stopSniffing signal or if packetSource closes.
 		defer func() {
-			pcapMutex.Lock()
-			if pcapHandle != nil {
-				pcapHandle.Close()
-				logToClients("info", "pcap.Handle closed for %s in sniffing goroutine.", activeConfig.PcapDeviceName)
+			currentHandle.Close()
+			logToClients("info", "pcap.Handle closed for %s in sniffing goroutine.", devName)
+			// Remove from active maps after goroutine cleanup
+			activeSniffersMutex.Lock()
+			delete(activeConfigs, devName)
+			delete(pcapHandles, devName)
+			delete(stopSniffingChans, devName)
+			activeSniffersMutex.Unlock()
+			logToClients("info", "Cleaned up resources for %s after sniffing stopped.", devName)
+
+			// Attempt to remove from persisted active interfaces
+			if errDb := store.RemoveActiveInterface(DB, devName); errDb != nil {
+				logToClients("error", "Failed to remove persisted interface %s from DB: %v", devName, errDb)
+			} else {
+				logToClients("info", "Successfully removed persisted interface %s from DB.", devName)
 			}
-			pcapMutex.Unlock()
 		}()
 
-		logToClients("info", "Listening on pcap device %s (System: %s) with filter: \"%s\"", activeConfig.PcapDeviceName, activeConfig.SystemInterfaceName, filter)
-		packetSource := gopacket.NewPacketSource(pcapHandle, pcapHandle.LinkType())
+		logToClients("info", "Listening on pcap device %s (System: %s) with filter: \"%s\"", devName, currentConfig.SystemInterfaceName, filter)
+		packetSource := gopacket.NewPacketSource(currentHandle, currentHandle.LinkType())
+
 		for {
 			select {
-			case <-stopSniffing:
-				logToClients("info", "Sniffing goroutine on %s received stop signal.", activeConfig.PcapDeviceName)
+			case <-currentStopChan:
+				logToClients("info", "Sniffing goroutine on %s received stop signal.", devName)
 				return
 			case packet, ok := <-packetSource.Packets():
 				if !ok {
-					logToClients("info", "Packet source closed for %s.", activeConfig.PcapDeviceName)
+					logToClients("info", "Packet source closed for %s.", devName)
 					return
 				}
 				// Process packet
@@ -187,9 +187,7 @@ func startSniffing(pcapDeviceName string) error {
 				ip := ipLayer.(*layers.IPv4)
 				tcp := tcpLayer.(*layers.TCP)
 
-				// Use PcapDeviceName for logging within the packet processing loop
-				currentPcapDeviceName := activeConfig.PcapDeviceName // Capture for consistent logging
-
+				// Log with pcapDeviceName to distinguish logs
 				specificKey := fmt.Sprintf("%s:%d", ip.SrcIP.String(), tcp.SrcPort)
 				ipOnlyKey := ip.SrcIP.String()
 
@@ -207,22 +205,43 @@ func startSniffing(pcapDeviceName string) error {
 				blacklistMutex.RUnlock()
 
 				if blocked {
-					logToClients("intercept", "Blacklisted SYN from %s (Reason: %s) on %s. Sending RST...", ip.SrcIP, blockReason, currentPcapDeviceName)
-					if err := sendRstPacket(pcapHandle, eth, ip, tcp); err != nil {
-						logToClients("error", "Fail to send RST to blacklisted %s (Reason: %s) on %s: %v", ip.SrcIP, blockReason, currentPcapDeviceName, err)
+					logToClients("intercept", "Blacklisted SYN from %s (Reason: %s) on %s. Sending RST...", ip.SrcIP, blockReason, devName)
+					if err := sendRstPacket(currentHandle, eth, ip, tcp); err != nil {
+						logToClients("error", "Fail to send RST to blacklisted %s (Reason: %s) on %s: %v", ip.SrcIP, blockReason, devName, err)
 					}
 				} else if !isInternalIP(ip.SrcIP) {
-					logToClients("intercept", "External SYN from %s:%d on %s. Sending RST...", ip.SrcIP, tcp.SrcPort, currentPcapDeviceName)
-					if err := sendRstPacket(pcapHandle, eth, ip, tcp); err != nil {
-						logToClients("error", "Fail to send RST to external %s:%d on %s: %v", ip.SrcIP, tcp.SrcPort, currentPcapDeviceName, err)
+					logToClients("intercept", "External SYN from %s:%d on %s. Sending RST...", ip.SrcIP, tcp.SrcPort, devName)
+					if err := sendRstPacket(currentHandle, eth, ip, tcp); err != nil {
+						logToClients("error", "Fail to send RST to external %s:%d on %s: %v", ip.SrcIP, tcp.SrcPort, devName, err)
 					}
 				} else {
-					logToClients("connect", "Internal SYN from %s:%d on %s. Allowing.", ip.SrcIP, tcp.SrcPort, currentPcapDeviceName)
+					logToClients("connect", "Internal SYN from %s:%d on %s. Allowing.", ip.SrcIP, tcp.SrcPort, devName)
 				}
 			}
 		}
-	}()
+	}(pcapDeviceName, handle, cfg, stopChan)
 
+	return nil
+}
+
+// stopSniffingOnInterface signals a specific sniffing goroutine to stop.
+func stopSniffingOnInterface(pcapDeviceName string) error {
+	activeSniffersMutex.Lock()
+	defer activeSniffersMutex.Unlock()
+
+	stopChan, exists := stopSniffingChans[pcapDeviceName]
+	if !exists {
+		logToClients("info", "No active sniffing process found for %s to stop.", pcapDeviceName)
+		return fmt.Errorf("no active sniffing process found for %s", pcapDeviceName)
+	}
+
+	close(stopChan) // Signal the goroutine to stop.
+
+	// The goroutine itself is responsible for closing its pcapHandle and removing itself
+	// from activeConfigs, pcapHandles, and stopSniffingChans via its defer function.
+	// This function just initiates the stop.
+
+	logToClients("info", "Stop signal sent to sniffing process on %s.", pcapDeviceName)
 	return nil
 }
 
@@ -301,16 +320,93 @@ func selectInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 	logToClients("info", "API call to select interface: %s", req.InterfaceName)
 
 	// Attempt to start sniffing on the new interface.
-	// startSniffing handles stopping any previous sniffing.
+	// Multiple interfaces can be active simultaneously.
 	if err := startSniffing(req.InterfaceName); err != nil {
+		// Check if the error is because sniffing is already active on this interface
+		// This is already logged by startSniffing, but we can provide a specific client message.
+		if err.Error() == fmt.Sprintf("sniffing already active on %s", req.InterfaceName) {
+			logToClients("info", "Sniffing already active on %s. No action taken.", req.InterfaceName)
+			// Return a success or specific status code indicating it's already running
+			w.WriteHeader(http.StatusOK) // Or http.StatusConflict if preferred
+			json.NewEncoder(w).Encode(map[string]string{"message": "Sniffing already active on interface: " + req.InterfaceName})
+			return
+		}
 		logToClients("error", "Failed to start sniffing on %s: %v", req.InterfaceName, err)
 		http.Error(w, fmt.Sprintf("Failed to start sniffing on %s: %v", req.InterfaceName, err), http.StatusInternalServerError)
 		return
 	}
 
 	logToClients("info", "Successfully selected and started sniffing on interface: %s", req.InterfaceName)
+
+	// Persist the newly activated interface
+	if errDb := store.AddActiveInterface(DB, req.InterfaceName); errDb != nil {
+		logToClients("error", "Failed to persist active interface %s to DB: %v", req.InterfaceName, errDb)
+		// Not returning an HTTP error here as sniffing has started, but logging the persistence failure.
+	} else {
+		logToClients("info", "Successfully persisted active interface %s to DB.", req.InterfaceName)
+	}
+
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "Successfully selected interface: " + req.InterfaceName})
+}
+
+// stopInterfaceHandler handles POST requests to /api/stop-interface.
+func stopInterfaceHandler(w http.ResponseWriter, r *http.Request) {
+	var req SelectInterfaceRequest // Reusing the same request structure for simplicity
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if req.InterfaceName == "" {
+		http.Error(w, "Interface name is required", http.StatusBadRequest)
+		return
+	}
+
+	logToClients("info", "API call to stop sniffing on interface: %s", req.InterfaceName)
+
+	err := stopSniffingOnInterface(req.InterfaceName)
+	if err != nil {
+		logToClients("error", "Failed to stop sniffing on %s: %v", req.InterfaceName, err)
+		// Check if the error means it wasn't running
+		if err.Error() == fmt.Sprintf("no active sniffing process found for %s", req.InterfaceName) {
+			w.WriteHeader(http.StatusOK) // Or a more specific code like 404 Not Found
+			json.NewEncoder(w).Encode(map[string]string{"message": "Interface " + req.InterfaceName + " was not actively sniffing."})
+			return
+		}
+		http.Error(w, fmt.Sprintf("Failed to stop sniffing on %s: %v", req.InterfaceName, err), http.StatusInternalServerError)
+		return
+	}
+
+	// If stopSniffingOnInterface was successful, the goroutine's defer will handle DB removal.
+	// No need to call store.RemoveActiveInterface here directly, as it would be redundant
+	// and could race if the goroutine hasn't finished its cleanup yet.
+	// The goroutine's cleanup is the single source of truth for DB removal upon stopping.
+
+	logToClients("info", "Successfully signaled sniffing to stop on interface: %s. DB record will be removed by the sniffing goroutine.", req.InterfaceName)
+	w.WriteHeader(http.StatusOK)
+	json.NewEncoder(w).Encode(map[string]string{"message": "Successfully signaled sniffing to stop on interface: " + req.InterfaceName})
+}
+
+// getActiveInterfacesStatusHandler handles GET requests to /api/active-interfaces.
+// It returns a list of pcap_device_name strings for all currently active sniffing interfaces.
+func getActiveInterfacesStatusHandler(w http.ResponseWriter, r *http.Request) {
+	activeSniffersMutex.Lock()
+	defer activeSniffersMutex.Unlock()
+
+	activeInterfaceIDs := make([]string, 0, len(activeConfigs))
+	for pcapDeviceName := range activeConfigs {
+		activeInterfaceIDs = append(activeInterfaceIDs, pcapDeviceName)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	err := json.NewEncoder(w).Encode(activeInterfaceIDs)
+	if err != nil {
+		logToClients("error", "Error encoding active interface IDs to JSON: %v", err)
+		http.Error(w, "Failed to encode active interfaces to JSON", http.StatusInternalServerError)
+		return
+	}
 }
 
 // getBlacklistHandler handles GET requests to /api/blacklist.
@@ -638,6 +734,11 @@ func listInterfaces() {
 */
 
 func main() {
+	// Initialize maps for multi-interface support
+	activeConfigs = make(map[string]*AppConfig)
+	pcapHandles = make(map[string]*pcap.Handle)
+	stopSniffingChans = make(map[string]chan struct{})
+
 	// --- Initialize Database ---
 	var err error // Declare err here to avoid shadowing DB within the if block
 	DB, err = store.InitDB("blacklist.db")
@@ -650,7 +751,16 @@ func main() {
 	if err != nil {
 		log.Fatalf("Failed to create blacklist table: %v", err)
 	}
-	log.Println("Database initialized and blacklist table created successfully.")
+	log.Println("Blacklist table created successfully.")
+
+	// Create active interfaces table
+	err = store.CreateActiveInterfacesTable(DB)
+	if err != nil {
+		log.Fatalf("Failed to create active_interfaces table: %v", err)
+	}
+	log.Println("Active interfaces table created successfully.")
+
+	log.Println("Database initialized.")
 
 	// Load blacklist entries
 	entries, err := store.GetBlacklistEntries(DB)
@@ -668,11 +778,34 @@ func main() {
 	}
 	log.Printf("Loaded %d entries into the blacklist.", len(currentBlacklist))
 
-	// Sniffing is no longer started automatically here.
-	// It will be started via the /api/select-interface endpoint.
-	// Old command-line interface selection and hardcoded values have been removed.
-	log.Println("Application initialized. Select a network interface via the API to start sniffing.")
+	// Load and start persisted active interfaces
+	persistedInterfaces, err := store.GetActiveInterfaces(DB)
+	if err != nil {
+		log.Fatalf("Failed to get persisted active interfaces: %v", err)
+	}
 
+	if len(persistedInterfaces) > 0 {
+		log.Printf("Found %d persisted active interfaces. Attempting to restart sniffing on them...", len(persistedInterfaces))
+		for _, deviceName := range persistedInterfaces {
+			logToClients("info", "Attempting to restart sniffing on persisted interface: %s", deviceName)
+			if errSniff := startSniffing(deviceName); errSniff != nil {
+				logToClients("error", "Failed to restart sniffing on %s: %v. It might need to be manually re-selected or may no longer be available.", deviceName, errSniff)
+				// If startup fails for a persisted interface, remove it from DB to avoid repeated failures.
+				if errDb := store.RemoveActiveInterface(DB, deviceName); errDb != nil {
+					logToClients("error", "Additionally, failed to remove problematic persisted interface %s from DB: %v", deviceName, errDb)
+				} else {
+					logToClients("info", "Problematic persisted interface %s removed from DB.", deviceName)
+				}
+			} else {
+				logToClients("info", "Successfully restarted sniffing on persisted interface: %s", deviceName)
+				// No need to re-add to DB as it was already there.
+			}
+		}
+	} else {
+		log.Println("No persisted active interfaces found.")
+	}
+
+	log.Println("Application initialized. API is ready.")
 	// --- Start WebSocket server and API endpoints in a goroutine ---
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -703,10 +836,28 @@ func main() {
 			}
 		})
 
+		// Register handler for /api/stop-interface
+		http.HandleFunc("/api/stop-interface", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPost {
+				stopInterfaceHandler(w, r)
+			} else {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
 		// Register handler for /api/interfaces
 		http.HandleFunc("/api/interfaces", func(w http.ResponseWriter, r *http.Request) {
 			if r.Method == http.MethodGet {
 				getInterfacesHandler(w, r)
+			} else {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
+		// Register handler for /api/active-interfaces
+		http.HandleFunc("/api/active-interfaces", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				getActiveInterfacesStatusHandler(w, r)
 			} else {
 				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			}

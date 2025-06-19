@@ -1,146 +1,158 @@
 <template>
   <div class="interface-selector">
-    <h2>Select Network Interface</h2>
+    <h2>Network Interfaces</h2>
     <div v-if="message" :class="['message', messageType]">{{ message }}</div>
 
-    <div class="controls">
-      <select v-model="selectedInterface" :disabled="isLoading">
-        <option disabled value="">-- Select Interface --</option>
-        <option v-for="iface in interfaces" :key="iface.id" :value="iface.id">
-          {{ iface.displayName }} <span v-if="iface.addresses && iface.addresses.length > 0">({{ iface.addresses.join(', ') }})</span>
-        </option>
-      </select>
-      <button @click="startListening" :disabled="isLoading || !selectedInterface">
-        {{ isLoading ? 'Loading...' : 'Start Listening' }}
-      </button>
+    <div v-if="isLoading" class="loader">Loading interface data...</div>
+
+    <ul v-else-if="interfaces.length > 0" class="interface-list">
+      <li v-for="iface in interfaces" :key="iface.id" class="interface-item">
+        <div class="interface-info">
+          <span class="interface-name">{{ iface.displayName }}</span>
+          <span v-if="iface.addresses && iface.addresses.length > 0" class="interface-addresses">
+            ({{ iface.addresses.join(', ') }})
+          </span>
+        </div>
+        <div class="interface-status">
+          <span :class="['status-indicator', { 'active': isInterfaceActive(iface.id) }]">
+            {{ isInterfaceActive(iface.id) ? 'Active' : 'Inactive' }}
+          </span>
+          <button
+            v-if="!isInterfaceActive(iface.id)"
+            @click="startListeningOn(iface.id)"
+            :disabled="isUpdating[iface.id]"
+            class="action-button start-button">
+            {{ isUpdating[iface.id] ? 'Starting...' : 'Start' }}
+          </button>
+          <button
+            v-if="isInterfaceActive(iface.id)"
+            @click="stopListeningOn(iface.id)"
+            :disabled="isUpdating[iface.id]"
+            class="action-button stop-button">
+            {{ isUpdating[iface.id] ? 'Stopping...' : 'Stop' }}
+          </button>
+        </div>
+      </li>
+    </ul>
+    <div v-else class="no-interfaces">
+      No network interfaces found. Ensure the backend is running and interfaces are available.
     </div>
-    <div v-if="isLoading" class="loader">Loading interfaces...</div>
   </div>
 </template>
 
 <script setup>
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, computed } from 'vue';
 
 const interfaces = ref([]);
-const selectedInterface = ref('');
-const isLoading = ref(false);
+const activeInterfaceIds = ref([]);
+const isLoading = ref(false); // General loading for initial data
+const isUpdating = ref({}); // Per-interface loading state e.g. { "eth0": true }
 const message = ref('');
 const messageType = ref(''); // 'success', 'error', or 'info'
 
-const LOCAL_STORAGE_KEY_SELECTED_INTERFACE = 'superFirewallSelectedInterface';
-
 async function fetchInterfaces() {
   isLoading.value = true;
-  // Do not clear message here if onMounted is to show a restoration message or if an error message needs to persist.
-  // message.value = '';
-  // messageType.value = '';
   try {
     const response = await fetch('/api/interfaces');
     if (!response.ok) {
-      const errorData = await response.json().catch(() => ({ message: 'Failed to fetch interfaces' }));
-      message.value = `Error fetching interfaces: ${errorData.message || `HTTP error! status: ${response.status}`}`;
-      messageType.value = 'error';
-      interfaces.value = []; // Clear interfaces on error
-      throw new Error(message.value); // Throw to be caught by the same catch block
+      const errorData = await response.json().catch(() => ({ message: 'Failed to fetch interfaces list' }));
+      throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
     }
-    const data = await response.json();
-    interfaces.value = data;
-    if (data.length === 0) {
-      message.value = 'No suitable network interfaces found. Ensure the backend is running and interfaces are available.';
-      messageType.value = 'error'; // Or 'info' if preferred for this specific case
-    } else {
-      // Clear message only if it was not an error/empty list message from this fetch operation
-      // This allows a restoration message from onMounted to persist if there was no new error.
-      if (messageType.value !== 'error' && messageType.value !== 'info') { // Don't clear info messages either
-        message.value = '';
-      }
+    interfaces.value = await response.json();
+    if (interfaces.value.length === 0) {
+      message.value = 'No suitable network interfaces found.';
+      messageType.value = 'info';
     }
   } catch (error) {
     console.error('Error fetching interfaces:', error);
-    // If message isn't already set by the try block (e.g. network error before .json()), set it now.
-    if (!message.value) {
-        message.value = `Error fetching interfaces: ${error.message}`;
-        messageType.value = 'error';
-    }
-    interfaces.value = []; // Ensure interfaces are empty on error
+    message.value = `Error fetching interfaces: ${error.message}`;
+    messageType.value = 'error';
+    interfaces.value = [];
   } finally {
-    isLoading.value = false;
+    // isLoading will be set to false after all onMounted fetches complete
   }
 }
 
-async function startListening() {
-  if (!selectedInterface.value) {
-    message.value = 'Please select an interface first.';
-    messageType.value = 'error';
-    return;
+async function fetchActiveInterfaces() {
+  // This can be called without setting global isLoading, as it's for refreshing status
+  try {
+    const response = await fetch('/api/active-interfaces');
+    if (!response.ok) {
+      const errorData = await response.json().catch(() => ({ message: 'Failed to fetch active interfaces list' }));
+      throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+    }
+    activeInterfaceIds.value = await response.json();
+  } catch (error) {
+    console.error('Error fetching active interfaces:', error);
+    // Potentially set a non-critical message, or rely on periodic refresh
+    message.value = `Could not refresh active interfaces: ${error.message}`;
+    messageType.value = 'error'; // Or a less intrusive 'info'
   }
-  isLoading.value = true;
+}
+
+const isInterfaceActive = (interfaceId) => {
+  return activeInterfaceIds.value.includes(interfaceId);
+};
+
+async function startListeningOn(interfaceId) {
+  isUpdating.value[interfaceId] = true;
   message.value = '';
   messageType.value = '';
-
   try {
     const response = await fetch('/api/select-interface', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ interface_name: selectedInterface.value }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ interface_name: interfaceId }),
     });
-
-    const responseData = await response.json().catch(() => ({ message: 'Response was not valid JSON.' }));
-
+    const responseData = await response.json().catch(() => ({})); // Allow empty or non-json success
     if (!response.ok) {
-      const errorMsg = responseData?.message || `HTTP error! Status: ${response.status}`;
-      throw new Error(errorMsg);
+      throw new Error(responseData.message || `Failed to start listening on ${interfaceId}. Status: ${response.status}`);
     }
-
-    // Find the displayName for the success message
-    const selectedIface = interfaces.value.find(iface => iface.id === selectedInterface.value);
-    const displayName = selectedIface ? selectedIface.displayName : selectedInterface.value;
-
-    message.value = responseData?.message || `Successfully started listening on ${displayName}`;
+    message.value = responseData.message || `Successfully started listening on ${interfaceId}.`;
     messageType.value = 'success';
-
-    // Save to localStorage on successful start
-    localStorage.setItem(LOCAL_STORAGE_KEY_SELECTED_INTERFACE, selectedInterface.value);
-
+    await fetchActiveInterfaces(); // Refresh active list
   } catch (error) {
-    console.error('Error starting listening:', error);
-    message.value = `Error starting listening: ${error.message || 'Unknown error'}`;
+    console.error(`Error starting listening on ${interfaceId}:`, error);
+    message.value = error.message;
     messageType.value = 'error';
   } finally {
-    isLoading.value = false;
+    isUpdating.value[interfaceId] = false;
+  }
+}
+
+async function stopListeningOn(interfaceId) {
+  isUpdating.value[interfaceId] = true;
+  message.value = '';
+  messageType.value = '';
+  try {
+    const response = await fetch('/api/stop-interface', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ interface_name: interfaceId }),
+    });
+    const responseData = await response.json().catch(() => ({})); // Allow empty or non-json success
+    if (!response.ok) {
+      throw new Error(responseData.message || `Failed to stop listening on ${interfaceId}. Status: ${response.status}`);
+    }
+    message.value = responseData.message || `Successfully stopped listening on ${interfaceId}.`;
+    messageType.value = 'success';
+    await fetchActiveInterfaces(); // Refresh active list
+  } catch (error) {
+    console.error(`Error stopping listening on ${interfaceId}:`, error);
+    message.value = error.message;
+    messageType.value = 'error';
+  } finally {
+    isUpdating.value[interfaceId] = false;
   }
 }
 
 onMounted(async () => {
-  // Clear any persistent message from previous states before fetching.
+  isLoading.value = true; // Start global loading
   message.value = '';
   messageType.value = '';
-
   await fetchInterfaces();
-
-  // Only attempt to restore if interfaces were fetched successfully and no critical error message was set by fetchInterfaces
-  if (interfaces.value.length > 0 && messageType.value !== 'error') {
-    const savedInterfaceId = localStorage.getItem(LOCAL_STORAGE_KEY_SELECTED_INTERFACE);
-    if (savedInterfaceId) {
-      const isValidInterface = interfaces.value.some(iface => iface.id === savedInterfaceId);
-      if (isValidInterface) {
-        selectedInterface.value = savedInterfaceId;
-        const restoredIface = interfaces.value.find(iface => iface.id === savedInterfaceId);
-        const displayName = restoredIface ? restoredIface.displayName : savedInterfaceId;
-        // Set info message only if fetchInterfaces didn't set its own (e.g. "no interfaces found" which is an error type)
-        // and there isn't already an error message.
-        if (messageType.value !== 'error') { // Check again in case fetchInterfaces set a non-error but important message
-             message.value = `Previously selected interface '${displayName}' restored. Click 'Start Listening' to activate.`;
-             messageType.value = 'info';
-        }
-      } else {
-        // Saved interface is no longer valid (e.g., removed, changed), so remove the stale entry
-        localStorage.removeItem(LOCAL_STORAGE_KEY_SELECTED_INTERFACE);
-      }
-    }
-  }
+  await fetchActiveInterfaces();
+  isLoading.value = false; // End global loading
 });
 </script>
 
@@ -156,39 +168,100 @@ onMounted(async () => {
 .interface-selector h2 {
   margin-top: 0;
   color: #333;
+  margin-bottom: 15px;
 }
 
-.controls {
+.loader {
+  margin-top: 10px;
+  color: #555;
+  font-style: italic;
+}
+
+.interface-list {
+  list-style-type: none;
+  padding: 0;
+}
+
+.interface-item {
   display: flex;
-  gap: 10px;
+  justify-content: space-between;
   align-items: center;
-  margin-bottom: 10px;
+  padding: 10px;
+  border-bottom: 1px solid #eee;
 }
 
-select {
-  padding: 8px 12px;
-  border: 1px solid #ddd;
+.interface-item:last-child {
+  border-bottom: none;
+}
+
+.interface-info {
+  display: flex;
+  flex-direction: column;
+}
+
+.interface-name {
+  font-weight: bold;
+  color: #2c3e50;
+}
+
+.interface-addresses {
+  font-size: 0.9em;
+  color: #555;
+}
+
+.interface-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.status-indicator {
+  font-size: 0.9em;
+  padding: 3px 8px;
   border-radius: 4px;
-  flex-grow: 1;
+  font-weight: bold;
 }
 
-button {
-  padding: 8px 15px;
-  background-color: #007bff;
+.status-indicator.active {
+  background-color: #28a745; /* Green */
   color: white;
+}
+
+.status-indicator:not(.active) {
+  background-color: #6c757d; /* Gray */
+  color: white;
+}
+
+.action-button {
+  padding: 6px 12px;
   border: none;
   border-radius: 4px;
   cursor: pointer;
   transition: background-color 0.2s;
+  font-size: 0.9em;
 }
 
-button:disabled {
+.action-button:disabled {
   background-color: #ccc;
   cursor: not-allowed;
 }
 
-button:not(:disabled):hover {
+.start-button {
+  background-color: #007bff; /* Blue */
+  color: white;
+}
+
+.start-button:not(:disabled):hover {
   background-color: #0056b3;
+}
+
+.stop-button {
+  background-color: #dc3545; /* Red */
+  color: white;
+}
+
+.stop-button:not(:disabled):hover {
+  background-color: #c82333;
 }
 
 .message {
@@ -211,13 +284,13 @@ button:not(:disabled):hover {
 }
 
 .message.info {
-  background-color: #e7f3ff; /* Light blue background */
-  color: #004085; /* Dark blue text */
-  border: 1px solid #b8daff; /* Lighter blue border */
+  background-color: #e7f3ff;
+  color: #004085;
+  border: 1px solid #b8daff;
 }
 
-.loader {
-  margin-top: 10px;
+.no-interfaces {
+  padding: 10px;
   color: #555;
   font-style: italic;
 }
