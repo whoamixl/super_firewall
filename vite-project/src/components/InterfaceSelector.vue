@@ -6,8 +6,8 @@
     <div class="controls">
       <select v-model="selectedInterface" :disabled="isLoading">
         <option disabled value="">-- Select Interface --</option>
-        <option v-for="iface in interfaces" :key="iface.name" :value="iface.name">
-          {{ iface.name }} <span v-if="iface.addresses && iface.addresses.length > 0">({{ iface.addresses.join(', ') }})</span>
+        <option v-for="iface in interfaces" :key="iface.id" :value="iface.id">
+          {{ iface.displayName }} <span v-if="iface.addresses && iface.addresses.length > 0">({{ iface.addresses.join(', ') }})</span>
         </option>
       </select>
       <button @click="startListening" :disabled="isLoading || !selectedInterface">
@@ -41,9 +41,9 @@ async function fetchInterfaces() {
     interfaces.value = data;
     if (data.length > 0) {
       // Optionally pre-select if needed, or leave as is for user to select
-      // selectedInterface.value = data[0].name;
+      // selectedInterface.value = data[0].id; // If pre-selecting, use id
     } else {
-      message.value = 'No network interfaces found.';
+      message.value = 'No suitable network interfaces found. Ensure the backend is running and interfaces are available.';
       messageType.value = 'error';
     }
   } catch (error) {
@@ -74,18 +74,22 @@ async function startListening() {
       body: JSON.stringify({ interface_name: selectedInterface.value }),
     });
 
-    const responseData = await response.json().catch(() => null);
+    const responseData = await response.json().catch(() => ({ message: 'Response was not valid JSON.' }));
 
     if (!response.ok) {
-      const errorMsg = responseData?.message || `HTTP error! status: ${response.status}`;
+      const errorMsg = responseData?.message || `HTTP error! Status: ${response.status}`;
       throw new Error(errorMsg);
     }
 
-    message.value = responseData?.message || `Successfully started listening on ${selectedInterface.value}`;
+    // Find the displayName for the success message
+    const selectedIface = interfaces.value.find(iface => iface.id === selectedInterface.value);
+    const displayName = selectedIface ? selectedIface.displayName : selectedInterface.value;
+
+    message.value = responseData?.message || `Successfully started listening on ${displayName}`;
     messageType.value = 'success';
   } catch (error) {
     console.error('Error starting listening:', error);
-    message.value = `Error starting listening: ${error.message}`;
+    message.value = `Error starting listening: ${error.message || 'Unknown error'}`;
     messageType.value = 'error';
   } finally {
     isLoading.value = false;
