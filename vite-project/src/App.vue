@@ -94,9 +94,10 @@ onUnmounted(() => {
 <template>
   <div id="app">
     <h1>Super Firewall</h1>
-    <InterfaceSelector />
-    <hr />
-    <BlacklistManager />
+    <div class="management-sections-container">
+      <InterfaceSelector />
+      <BlacklistManager />
+    </div>
     <hr />
     <h2>Firewall Logs</h2>
     <div class="log-container">
@@ -132,6 +133,29 @@ onUnmounted(() => {
   color: #2c3e50;
   margin-top: 20px; /* Adjusted margin */
 }
+
+.management-sections-container {
+  display: flex;
+  flex-wrap: wrap; // Allow wrapping on small screens
+  justify-content: space-around; // Good for distributing space
+  align-items: flex-start;
+  gap: 20px;
+  margin-bottom: 20px;
+}
+
+/* Target the root elements of the child components */
+.management-sections-container > :deep(.interface-selector),
+.management-sections-container > :deep(.blacklist-manager) {
+  flex-grow: 1; // Allow them to grow
+  flex-basis: 400px; // Suggest a base width. Adjust as needed.
+  /* min-width: 300px; // Optional: Prevent them from becoming too small */
+}
+
+/* Override margin:auto from BlacklistManager.vue if it's problematic */
+.management-sections-container > :deep(.blacklist-manager) {
+  margin: 0; // Remove margin:auto to prevent centering within its flex allocation
+}
+
 
 h1 {
   color: #3498db;

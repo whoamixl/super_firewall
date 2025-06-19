@@ -1,7 +1,7 @@
 <template>
   <div class="interface-selector">
     <h2>Select Network Interface</h2>
-    <div v_if="message" :class="['message', messageType]">{{ message }}</div>
+    <div v-if="message" :class="['message', messageType]">{{ message }}</div>
 
     <div class="controls">
       <select v-model="selectedInterface" :disabled="isLoading">
@@ -25,31 +25,44 @@ const interfaces = ref([]);
 const selectedInterface = ref('');
 const isLoading = ref(false);
 const message = ref('');
-const messageType = ref(''); // 'success' or 'error'
+const messageType = ref(''); // 'success', 'error', or 'info'
+
+const LOCAL_STORAGE_KEY_SELECTED_INTERFACE = 'superFirewallSelectedInterface';
 
 async function fetchInterfaces() {
   isLoading.value = true;
-  message.value = '';
-  messageType.value = '';
+  // Do not clear message here if onMounted is to show a restoration message or if an error message needs to persist.
+  // message.value = '';
+  // messageType.value = '';
   try {
     const response = await fetch('/api/interfaces');
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ message: 'Failed to fetch interfaces' }));
-      throw new Error(errorData.message || `HTTP error! status: ${response.status}`);
+      message.value = `Error fetching interfaces: ${errorData.message || `HTTP error! status: ${response.status}`}`;
+      messageType.value = 'error';
+      interfaces.value = []; // Clear interfaces on error
+      throw new Error(message.value); // Throw to be caught by the same catch block
     }
     const data = await response.json();
     interfaces.value = data;
-    if (data.length > 0) {
-      // Optionally pre-select if needed, or leave as is for user to select
-      // selectedInterface.value = data[0].id; // If pre-selecting, use id
-    } else {
+    if (data.length === 0) {
       message.value = 'No suitable network interfaces found. Ensure the backend is running and interfaces are available.';
-      messageType.value = 'error';
+      messageType.value = 'error'; // Or 'info' if preferred for this specific case
+    } else {
+      // Clear message only if it was not an error/empty list message from this fetch operation
+      // This allows a restoration message from onMounted to persist if there was no new error.
+      if (messageType.value !== 'error' && messageType.value !== 'info') { // Don't clear info messages either
+        message.value = '';
+      }
     }
   } catch (error) {
     console.error('Error fetching interfaces:', error);
-    message.value = `Error fetching interfaces: ${error.message}`;
-    messageType.value = 'error';
+    // If message isn't already set by the try block (e.g. network error before .json()), set it now.
+    if (!message.value) {
+        message.value = `Error fetching interfaces: ${error.message}`;
+        messageType.value = 'error';
+    }
+    interfaces.value = []; // Ensure interfaces are empty on error
   } finally {
     isLoading.value = false;
   }
@@ -87,6 +100,10 @@ async function startListening() {
 
     message.value = responseData?.message || `Successfully started listening on ${displayName}`;
     messageType.value = 'success';
+
+    // Save to localStorage on successful start
+    localStorage.setItem(LOCAL_STORAGE_KEY_SELECTED_INTERFACE, selectedInterface.value);
+
   } catch (error) {
     console.error('Error starting listening:', error);
     message.value = `Error starting listening: ${error.message || 'Unknown error'}`;
@@ -96,8 +113,34 @@ async function startListening() {
   }
 }
 
-onMounted(() => {
-  fetchInterfaces();
+onMounted(async () => {
+  // Clear any persistent message from previous states before fetching.
+  message.value = '';
+  messageType.value = '';
+
+  await fetchInterfaces();
+
+  // Only attempt to restore if interfaces were fetched successfully and no critical error message was set by fetchInterfaces
+  if (interfaces.value.length > 0 && messageType.value !== 'error') {
+    const savedInterfaceId = localStorage.getItem(LOCAL_STORAGE_KEY_SELECTED_INTERFACE);
+    if (savedInterfaceId) {
+      const isValidInterface = interfaces.value.some(iface => iface.id === savedInterfaceId);
+      if (isValidInterface) {
+        selectedInterface.value = savedInterfaceId;
+        const restoredIface = interfaces.value.find(iface => iface.id === savedInterfaceId);
+        const displayName = restoredIface ? restoredIface.displayName : savedInterfaceId;
+        // Set info message only if fetchInterfaces didn't set its own (e.g. "no interfaces found" which is an error type)
+        // and there isn't already an error message.
+        if (messageType.value !== 'error') { // Check again in case fetchInterfaces set a non-error but important message
+             message.value = `Previously selected interface '${displayName}' restored. Click 'Start Listening' to activate.`;
+             messageType.value = 'info';
+        }
+      } else {
+        // Saved interface is no longer valid (e.g., removed, changed), so remove the stale entry
+        localStorage.removeItem(LOCAL_STORAGE_KEY_SELECTED_INTERFACE);
+      }
+    }
+  }
 });
 </script>
 
@@ -165,6 +208,12 @@ button:not(:disabled):hover {
   background-color: #f8d7da;
   color: #721c24;
   border: 1px solid #f5c6cb;
+}
+
+.message.info {
+  background-color: #e7f3ff; /* Light blue background */
+  color: #004085; /* Dark blue text */
+  border: 1px solid #b8daff; /* Lighter blue border */
 }
 
 .loader {

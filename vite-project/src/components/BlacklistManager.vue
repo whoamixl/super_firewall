@@ -10,7 +10,7 @@
       </div>
       <div>
         <label for="port">Port:</label>
-        <input type="number" id="port" v.model.number="newEntry.port" required min="1" max="65535">
+        <input type="number" id="port" v.model.number="newEntry.port" min="1" max="65535" placeholder="(leave empty for IP-only)">
       </div>
       <button type="submit">Add to Blacklist</button>
     </form>
@@ -20,8 +20,13 @@
     <!-- Display existing blacklist entries -->
     <h3>Current Blacklist</h3>
     <ul v-if="blacklist.length > 0">
-      <li v-for="entry in blacklist" :key="entry.id || `${entry.ip_address}:${entry.port}`">
-        {{ entry.ip_address }}:{{ entry.port }}
+      <li v-for="entry in blacklist" :key="entry.id || `${entry.ip_address}:${entry.port === null ? 'all' : entry.port}`">
+        <span v-if="entry.port === null || entry.port === undefined">
+          {{ entry.ip_address }} (All Ports)
+        </span>
+        <span v-else>
+          {{ entry.ip_address }}:{{ entry.port }}
+        </span>
         <button @click="deleteEntry(entry.ip_address, entry.port)">Delete</button>
       </li>
     </ul>
@@ -60,21 +65,40 @@ async function fetchBlacklist() {
 async function addEntry() {
   errorMessage.value = '';
   successMessage.value = '';
-  if (!newEntry.value.ip_address || newEntry.value.port === null) {
-    errorMessage.value = 'IP Address and Port are required.';
+  if (!newEntry.value.ip_address) {
+    errorMessage.value = 'IP Address is required.';
     return;
   }
+
+  const payload = {
+    ip_address: newEntry.value.ip_address,
+    port: null // Default to null for IP-only
+  };
+
+  const portValue = newEntry.value.port; // v-model.number might make it null or a number
+
+  if (portValue && !isNaN(parseInt(portValue)) && parseInt(portValue) > 0 && parseInt(portValue) <= 65535) {
+    payload.port = parseInt(portValue);
+  } else if (portValue && (parseInt(portValue) <= 0 || parseInt(portValue) > 65535 || isNaN(parseInt(portValue)))) {
+    // If port is specified but invalid (e.g. 0, negative, too large, or not a number after trying to parse)
+    errorMessage.value = 'Invalid Port. Must be between 1 and 65535, or leave empty for IP-only.';
+    return;
+  }
+  // If portValue is null, undefined, or an empty string that results in NaN or 0 from parseInt,
+  // payload.port remains null, which is correct for IP-only.
+
   try {
     const response = await fetch(API_URL, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(newEntry.value),
+      body: JSON.stringify(payload),
     });
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ message: 'Unknown error occurred' }));
-      throw new Error(`Failed to add entry: ${response.status} ${errorData.message || ''}`);
+      throw new Error(`Failed to add entry: ${response.status} ${errorData.message || 'Check server logs for details.'}`);
     }
-    successMessage.value = `Successfully added ${newEntry.value.ip_address}:${newEntry.value.port} to blacklist.`;
+    const displayPort = payload.port === null ? '(All Ports)' : `:${payload.port}`;
+    successMessage.value = `Successfully added ${payload.ip_address}${displayPort} to blacklist.`;
     newEntry.value = { ip_address: '', port: null }; // Reset form
     await fetchBlacklist(); // Refresh list
   } catch (error) {
@@ -88,16 +112,26 @@ async function deleteEntry(ipAddress, port) {
   errorMessage.value = '';
   successMessage.value = '';
   try {
+    const payload = {
+      ip_address: ipAddress,
+      port: null // Default to null for IP-only
+    };
+    // The 'port' argument comes from the entry object, which might have null for port
+    if (port !== null && port !== undefined && !isNaN(parseInt(port)) && parseInt(port) > 0) {
+      payload.port = parseInt(port);
+    }
+
     const response = await fetch(API_URL, {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ ip_address: ipAddress, port: port }),
+      body: JSON.stringify(payload),
     });
     if (!response.ok) {
       const errorData = await response.json().catch(() => ({ message: 'Unknown error occurred' }));
-      throw new Error(`Failed to delete entry: ${response.status} ${errorData.message || ''}`);
+      throw new Error(`Failed to delete entry: ${response.status} ${errorData.message || 'Check server logs for details.'}`);
     }
-    successMessage.value = `Successfully deleted ${ipAddress}:${port} from blacklist.`;
+    const displayPort = payload.port === null ? '(All Ports)' : `:${payload.port}`;
+    successMessage.value = `Successfully deleted ${ipAddress}${displayPort} from blacklist.`;
     await fetchBlacklist(); // Refresh list
   } catch (error) {
     console.error('Error deleting blacklist entry:', error);

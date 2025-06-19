@@ -38,7 +38,7 @@ type LogEntry struct {
 // BlacklistAPIRequest defines the structure for API requests to manage blacklist entries.
 type BlacklistAPIRequest struct {
 	IPAddress string `json:"ip_address"`
-	Port      int    `json:"port"`
+	Port      *int   `json:"port,omitempty"` // Changed to pointer, omitempty for optional
 }
 
 // SelectInterfaceRequest defines the structure for API requests to select a network interface.
@@ -187,19 +187,29 @@ func startSniffing(pcapDeviceName string) error {
 				ip := ipLayer.(*layers.IPv4)
 				tcp := tcpLayer.(*layers.TCP)
 
-				sourceKey := fmt.Sprintf("%s:%d", ip.SrcIP.String(), tcp.SrcPort)
-
-				blacklistMutex.RLock()
-				_, found := currentBlacklist[sourceKey]
-				blacklistMutex.RUnlock()
-
 				// Use PcapDeviceName for logging within the packet processing loop
 				currentPcapDeviceName := activeConfig.PcapDeviceName // Capture for consistent logging
 
-				if found {
-					logToClients("intercept", "Blacklisted SYN from %s on %s. Sending RST...", sourceKey, currentPcapDeviceName)
+				specificKey := fmt.Sprintf("%s:%d", ip.SrcIP.String(), tcp.SrcPort)
+				ipOnlyKey := ip.SrcIP.String()
+
+				blocked := false
+				blockReason := ""
+
+				blacklistMutex.RLock()
+				if _, found := currentBlacklist[specificKey]; found {
+					blocked = true
+					blockReason = fmt.Sprintf("IP:Port specific block (%s)", specificKey)
+				} else if _, found := currentBlacklist[ipOnlyKey]; found {
+					blocked = true
+					blockReason = fmt.Sprintf("IP-only block (%s)", ipOnlyKey)
+				}
+				blacklistMutex.RUnlock()
+
+				if blocked {
+					logToClients("intercept", "Blacklisted SYN from %s (Reason: %s) on %s. Sending RST...", ip.SrcIP, blockReason, currentPcapDeviceName)
 					if err := sendRstPacket(pcapHandle, eth, ip, tcp); err != nil {
-						logToClients("error", "Fail to send RST to blacklisted %s on %s: %v", sourceKey, currentPcapDeviceName, err)
+						logToClients("error", "Fail to send RST to blacklisted %s (Reason: %s) on %s: %v", ip.SrcIP, blockReason, currentPcapDeviceName, err)
 					}
 				} else if !isInternalIP(ip.SrcIP) {
 					logToClients("intercept", "External SYN from %s:%d on %s. Sending RST...", ip.SrcIP, tcp.SrcPort, currentPcapDeviceName)
@@ -328,25 +338,54 @@ func addBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	if req.IPAddress == "" || req.Port == 0 {
-		http.Error(w, "IP address and port are required", http.StatusBadRequest)
+	if req.IPAddress == "" {
+		http.Error(w, "IP address is required", http.StatusBadRequest)
 		return
 	}
+	// Port can be nil (for IP-only) or a valid port number.
+	// We might want to disallow port 0 if it's not nil, as it's often not a valid port for blocking.
+	// For now, if Port is provided (not nil) and is 0, it's treated as an IP-only block too.
+	// Or, we can return an error for port 0 if it's not nil.
+	// Let's assume nil means IP-only, and a 0 port is invalid if not nil.
+	// The task description says: "If req.Port is nil or *req.Port == 0 ... pass nil to store.AddBlacklistEntry"
+	// This implies 0 is also IP-only. Let's stick to that for now.
 
-	err := store.AddBlacklistEntry(DB, req.IPAddress, req.Port)
+	var effectivePort *int
+	var key string
+	var logMessagePort string
+
+	if req.Port == nil { // IP-only block
+		effectivePort = nil
+		key = req.IPAddress
+		logMessagePort = "IP-only"
+	} else { // Port is specified
+		// Optional: Validate port range if needed, e.g., *req.Port > 0 && *req.Port <= 65535
+		// if *req.Port == 0 { // As per current interpretation, treat 0 as IP-only as well
+		// 	 effectivePort = nil
+		// 	 key = req.IPAddress
+		// 	 logMessagePort = "IP-only (port 0 specified)"
+		// } else
+		if *req.Port <= 0 || *req.Port > 65535 { // Explicitly make port 0 invalid if *req.Port is not nil
+			http.Error(w, "Invalid port number. Port must be between 1 and 65535, or omitted for IP-only blocking.", http.StatusBadRequest)
+			return
+		}
+		effectivePort = req.Port
+		key = fmt.Sprintf("%s:%d", req.IPAddress, *req.Port)
+		logMessagePort = fmt.Sprintf("port %d", *req.Port)
+	}
+
+	err := store.AddBlacklistEntry(DB, req.IPAddress, effectivePort)
 	if err != nil {
-		// TODO: Check for unique constraint violation specifically if possible
-		log.Printf("Error adding blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
-		http.Error(w, "Failed to add blacklist entry", http.StatusInternalServerError)
+		log.Printf("Error adding blacklist entry (%s, %s): %v", req.IPAddress, logMessagePort, err)
+		http.Error(w, "Failed to add blacklist entry. It might already exist or there was a database error.", http.StatusInternalServerError) // Consider more specific errors
 		return
 	}
 
-	key := fmt.Sprintf("%s:%d", req.IPAddress, req.Port)
 	blacklistMutex.Lock()
 	currentBlacklist[key] = struct{}{}
 	blacklistMutex.Unlock()
 
-	logToClients("info", "Added %s to blacklist via API", key)
+	logToClients("info", "Added %s (%s) to blacklist via API", req.IPAddress, logMessagePort)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -359,24 +398,49 @@ func removeBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer r.Body.Close()
 
-	if req.IPAddress == "" || req.Port == 0 {
-		http.Error(w, "IP address and port are required", http.StatusBadRequest)
+	if req.IPAddress == "" {
+		http.Error(w, "IP address is required", http.StatusBadRequest)
 		return
 	}
 
-	err := store.RemoveBlacklistEntry(DB, req.IPAddress, req.Port)
+	var effectivePort *int
+	var key string
+	var logMessagePort string
+
+	if req.Port == nil { // IP-only block removal
+		effectivePort = nil
+		key = req.IPAddress
+		logMessagePort = "IP-only"
+	} else { // Port is specified for removal
+		// if *req.Port == 0 { // Treat 0 as IP-only for removal key consistency
+		// 	effectivePort = nil
+		// 	key = req.IPAddress
+		// 	logMessagePort = "IP-only (port 0 specified)"
+		// } else
+		if *req.Port <= 0 || *req.Port > 65535 {
+			http.Error(w, "Invalid port number. Port must be between 1 and 65535, or omitted for IP-only blocking.", http.StatusBadRequest)
+			return
+		}
+		effectivePort = req.Port
+		key = fmt.Sprintf("%s:%d", req.IPAddress, *req.Port)
+		logMessagePort = fmt.Sprintf("port %d", *req.Port)
+	}
+
+	err := store.RemoveBlacklistEntry(DB, req.IPAddress, effectivePort)
 	if err != nil {
-		log.Printf("Error removing blacklist entry (%s:%d): %v", req.IPAddress, req.Port, err)
+		log.Printf("Error removing blacklist entry (%s, %s): %v", req.IPAddress, logMessagePort, err)
+		// It's common for remove operations to not find the entry, which isn't always an error.
+		// However, store.RemoveBlacklistEntry doesn't distinguish "not found" from other errors.
+		// For simplicity, we'll return a generic error. A more robust solution might check sql.ErrNoRows if possible.
 		http.Error(w, "Failed to remove blacklist entry", http.StatusInternalServerError)
 		return
 	}
 
-	key := fmt.Sprintf("%s:%d", req.IPAddress, req.Port)
 	blacklistMutex.Lock()
 	delete(currentBlacklist, key)
 	blacklistMutex.Unlock()
 
-	logToClients("info", "Removed %s from blacklist via API", key)
+	logToClients("info", "Removed %s (%s) from blacklist via API", req.IPAddress, logMessagePort)
 	w.WriteHeader(http.StatusOK) // Or http.StatusNoContent
 }
 
@@ -594,7 +658,12 @@ func main() {
 		log.Fatalf("Failed to get blacklist entries: %v", err)
 	}
 	for _, entry := range entries {
-		key := fmt.Sprintf("%s:%d", entry.IPAddress, entry.Port)
+		var key string
+		if entry.Port == nil { // IP-only entry
+			key = entry.IPAddress
+		} else { // IP:Port entry
+			key = fmt.Sprintf("%s:%d", entry.IPAddress, *entry.Port)
+		}
 		currentBlacklist[key] = struct{}{}
 	}
 	log.Printf("Loaded %d entries into the blacklist.", len(currentBlacklist))
