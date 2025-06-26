@@ -98,35 +98,35 @@ func startSniffing(pcapDeviceName string) error {
 	activeSniffersMutex.Lock()
 	if _, exists := activeConfigs[pcapDeviceName]; exists {
 		activeSniffersMutex.Unlock()
-		logToClients("info", "Sniffing already active on %s", pcapDeviceName)
+		logToClients("info", nil, "Sniffing already active on %s", pcapDeviceName)
 		return fmt.Errorf("sniffing already active on %s", pcapDeviceName)
 	}
 
 	cfg, err := findInterfaceConfig(pcapDeviceName)
 	if err != nil {
 		activeSniffersMutex.Unlock()
-		logToClients("error", "Failed to find config for %s: %v", pcapDeviceName, err)
+		logToClients("error", nil, "Failed to find config for %s: %v", pcapDeviceName, err)
 		return fmt.Errorf("failed to find config for %s: %v", pcapDeviceName, err)
 	}
 
 	handle, err := pcap.OpenLive(pcapDeviceName, 1600, true, pcap.BlockForever)
 	if err != nil {
 		activeSniffersMutex.Unlock()
-		logToClients("error", "Error opening pcap device %s: %v", pcapDeviceName, err)
+		logToClients("error", nil, "Error opening pcap device %s: %v", pcapDeviceName, err)
 		return fmt.Errorf("error opening pcap device %s: %v", pcapDeviceName, err)
 	}
 
 	if cfg.IPv4Addr == nil {
 		activeSniffersMutex.Unlock()
 		handle.Close() // Close the handle if IPv4 is not available.
-		logToClients("error", "No IPv4 address for %s, cannot set BPF filter.", pcapDeviceName)
+		logToClients("error", nil, "No IPv4 address for %s, cannot set BPF filter.", pcapDeviceName)
 		return fmt.Errorf("no IPv4 address for %s", pcapDeviceName)
 	}
 	filter := fmt.Sprintf("tcp[tcpflags] & tcp-syn != 0 and not tcp[tcpflags] & tcp-ack != 0 and dst host %s", cfg.IPv4Addr.String())
 	if err := handle.SetBPFFilter(filter); err != nil {
 		activeSniffersMutex.Unlock()
 		handle.Close()
-		logToClients("error", "Error setting BPF filter on %s: %v", pcapDeviceName, err)
+		logToClients("error", nil, "Error setting BPF filter on %s: %v", pcapDeviceName, err)
 		return fmt.Errorf("error setting BPF filter on %s: %v", pcapDeviceName, err)
 	}
 
@@ -138,40 +138,40 @@ func startSniffing(pcapDeviceName string) error {
 	sniffingWaitGroup.Add(1)
 	activeSniffersMutex.Unlock()
 
-	logToClients("info", "Starting sniffing on %s (System: %s, IP: %s)", pcapDeviceName, cfg.SystemInterfaceName, cfg.IPv4Addr)
+	logToClients("info", nil, "Starting sniffing on %s (System: %s, IP: %s)", pcapDeviceName, cfg.SystemInterfaceName, cfg.IPv4Addr)
 
 	go func(devName string, currentHandle *pcap.Handle, currentConfig *AppConfig, currentStopChan chan struct{}) {
 		defer sniffingWaitGroup.Done()
 		defer func() {
 			currentHandle.Close()
-			logToClients("info", "pcap.Handle closed for %s in sniffing goroutine.", devName)
+			logToClients("info", nil, "pcap.Handle closed for %s in sniffing goroutine.", devName)
 			// Remove from active maps after goroutine cleanup
 			activeSniffersMutex.Lock()
 			delete(activeConfigs, devName)
 			delete(pcapHandles, devName)
 			delete(stopSniffingChans, devName)
 			activeSniffersMutex.Unlock()
-			logToClients("info", "Cleaned up resources for %s after sniffing stopped.", devName)
+			logToClients("info", nil, "Cleaned up resources for %s after sniffing stopped.", devName)
 
 			// Attempt to remove from persisted active interfaces
 			if errDb := store.RemoveActiveInterface(DB, devName); errDb != nil {
-				logToClients("error", "Failed to remove persisted interface %s from DB: %v", devName, errDb)
+				logToClients("error", nil, "Failed to remove persisted interface %s from DB: %v", devName, errDb)
 			} else {
-				logToClients("info", "Successfully removed persisted interface %s from DB.", devName)
+				logToClients("info", nil, "Successfully removed persisted interface %s from DB.", devName)
 			}
 		}()
 
-		logToClients("info", "Listening on pcap device %s (System: %s) with filter: \"%s\"", devName, currentConfig.SystemInterfaceName, filter)
+		logToClients("info", nil, "Listening on pcap device %s (System: %s) with filter: \"%s\"", devName, currentConfig.SystemInterfaceName, filter)
 		packetSource := gopacket.NewPacketSource(currentHandle, currentHandle.LinkType())
 
 		for {
 			select {
 			case <-currentStopChan:
-				logToClients("info", "Sniffing goroutine on %s received stop signal.", devName)
+				logToClients("info", nil, "Sniffing goroutine on %s received stop signal.", devName)
 				return
 			case packet, ok := <-packetSource.Packets():
 				if !ok {
-					logToClients("info", "Packet source closed for %s.", devName)
+					logToClients("info", nil, "Packet source closed for %s.", devName)
 					return
 				}
 				// Process packet
@@ -204,18 +204,21 @@ func startSniffing(pcapDeviceName string) error {
 				}
 				blacklistMutex.RUnlock()
 
+				dbCtx := &DBLogContext{IPAddress: ip.SrcIP.String(), PcapDeviceName: devName}
+
 				if blocked {
-					logToClients("intercept", "Blacklisted SYN from %s (Reason: %s) on %s. Sending RST...", ip.SrcIP, blockReason, devName)
+					logToClients("intercept", dbCtx, "Blacklisted SYN from %s (Reason: %s) on %s. Sending RST...", ip.SrcIP, blockReason, devName)
 					if err := sendRstPacket(currentHandle, eth, ip, tcp); err != nil {
-						logToClients("error", "Fail to send RST to blacklisted %s (Reason: %s) on %s: %v", ip.SrcIP, blockReason, devName, err)
+						// For this error, the primary IP is ip.SrcIP, related to the packet we tried to RST.
+						logToClients("error", dbCtx, "Fail to send RST to blacklisted %s (Reason: %s) on %s: %v", ip.SrcIP, blockReason, devName, err)
 					}
 				} else if !isInternalIP(ip.SrcIP) {
-					logToClients("intercept", "External SYN from %s:%d on %s. Sending RST...", ip.SrcIP, tcp.SrcPort, devName)
+					logToClients("intercept", dbCtx, "External SYN from %s:%d on %s. Sending RST...", ip.SrcIP, tcp.SrcPort, devName)
 					if err := sendRstPacket(currentHandle, eth, ip, tcp); err != nil {
-						logToClients("error", "Fail to send RST to external %s:%d on %s: %v", ip.SrcIP, tcp.SrcPort, devName, err)
+						logToClients("error", dbCtx, "Fail to send RST to external %s:%d on %s: %v", ip.SrcIP, tcp.SrcPort, devName, err)
 					}
 				} else {
-					logToClients("connect", "Internal SYN from %s:%d on %s. Allowing.", ip.SrcIP, tcp.SrcPort, devName)
+					logToClients("connect", dbCtx, "Internal SYN from %s:%d on %s. Allowing.", ip.SrcIP, tcp.SrcPort, devName)
 				}
 			}
 		}
@@ -231,7 +234,7 @@ func stopSniffingOnInterface(pcapDeviceName string) error {
 
 	stopChan, exists := stopSniffingChans[pcapDeviceName]
 	if !exists {
-		logToClients("info", "No active sniffing process found for %s to stop.", pcapDeviceName)
+		logToClients("info", nil, "No active sniffing process found for %s to stop.", pcapDeviceName)
 		return fmt.Errorf("no active sniffing process found for %s", pcapDeviceName)
 	}
 
@@ -241,7 +244,7 @@ func stopSniffingOnInterface(pcapDeviceName string) error {
 	// from activeConfigs, pcapHandles, and stopSniffingChans via its defer function.
 	// This function just initiates the stop.
 
-	logToClients("info", "Stop signal sent to sniffing process on %s.", pcapDeviceName)
+	logToClients("info", nil, "Stop signal sent to sniffing process on %s.", pcapDeviceName)
 	return nil
 }
 
@@ -256,7 +259,7 @@ type InterfaceDetail struct {
 func getInterfacesHandler(w http.ResponseWriter, r *http.Request) {
 	devices, err := pcap.FindAllDevs()
 	if err != nil {
-		logToClients("error", "Error finding pcap devices: %v", err)
+		logToClients("error", nil, "Error finding pcap devices: %v", err)
 		http.Error(w, "Failed to find network interfaces", http.StatusInternalServerError)
 		return
 	}
@@ -291,13 +294,13 @@ func getInterfacesHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(interfaceDetailsList) == 0 {
-		logToClients("info", "No suitable network interfaces found by pcap.FindAllDevs for the API response.")
+		logToClients("info", nil, "No suitable network interfaces found by pcap.FindAllDevs for the API response.")
 	}
 
 	w.Header().Set("Content-Type", "application/json")
 	err = json.NewEncoder(w).Encode(interfaceDetailsList)
 	if err != nil {
-		logToClients("error", "Error encoding interface details to JSON: %v", err)
+		logToClients("error", nil, "Error encoding interface details to JSON: %v", err)
 		http.Error(w, "Failed to encode interface details to JSON", http.StatusInternalServerError)
 		return
 	}
@@ -317,7 +320,7 @@ func selectInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logToClients("info", "API call to select interface: %s", req.InterfaceName)
+	logToClients("info", nil, "API call to select interface: %s", req.InterfaceName)
 
 	// Attempt to start sniffing on the new interface.
 	// Multiple interfaces can be active simultaneously.
@@ -325,25 +328,25 @@ func selectInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 		// Check if the error is because sniffing is already active on this interface
 		// This is already logged by startSniffing, but we can provide a specific client message.
 		if err.Error() == fmt.Sprintf("sniffing already active on %s", req.InterfaceName) {
-			logToClients("info", "Sniffing already active on %s. No action taken.", req.InterfaceName)
+			logToClients("info", nil, "Sniffing already active on %s. No action taken.", req.InterfaceName)
 			// Return a success or specific status code indicating it's already running
 			w.WriteHeader(http.StatusOK) // Or http.StatusConflict if preferred
 			json.NewEncoder(w).Encode(map[string]string{"message": "Sniffing already active on interface: " + req.InterfaceName})
 			return
 		}
-		logToClients("error", "Failed to start sniffing on %s: %v", req.InterfaceName, err)
+		logToClients("error", nil, "Failed to start sniffing on %s: %v", req.InterfaceName, err)
 		http.Error(w, fmt.Sprintf("Failed to start sniffing on %s: %v", req.InterfaceName, err), http.StatusInternalServerError)
 		return
 	}
 
-	logToClients("info", "Successfully selected and started sniffing on interface: %s", req.InterfaceName)
+	logToClients("info", nil, "Successfully selected and started sniffing on interface: %s", req.InterfaceName)
 
 	// Persist the newly activated interface
 	if errDb := store.AddActiveInterface(DB, req.InterfaceName); errDb != nil {
-		logToClients("error", "Failed to persist active interface %s to DB: %v", req.InterfaceName, errDb)
+		logToClients("error", nil, "Failed to persist active interface %s to DB: %v", req.InterfaceName, errDb)
 		// Not returning an HTTP error here as sniffing has started, but logging the persistence failure.
 	} else {
-		logToClients("info", "Successfully persisted active interface %s to DB.", req.InterfaceName)
+		logToClients("info", nil, "Successfully persisted active interface %s to DB.", req.InterfaceName)
 	}
 
 	w.WriteHeader(http.StatusOK)
@@ -364,11 +367,11 @@ func stopInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	logToClients("info", "API call to stop sniffing on interface: %s", req.InterfaceName)
+	logToClients("info", nil, "API call to stop sniffing on interface: %s", req.InterfaceName)
 
 	err := stopSniffingOnInterface(req.InterfaceName)
 	if err != nil {
-		logToClients("error", "Failed to stop sniffing on %s: %v", req.InterfaceName, err)
+		logToClients("error", nil, "Failed to stop sniffing on %s: %v", req.InterfaceName, err)
 		// Check if the error means it wasn't running
 		if err.Error() == fmt.Sprintf("no active sniffing process found for %s", req.InterfaceName) {
 			w.WriteHeader(http.StatusOK) // Or a more specific code like 404 Not Found
@@ -384,7 +387,7 @@ func stopInterfaceHandler(w http.ResponseWriter, r *http.Request) {
 	// and could race if the goroutine hasn't finished its cleanup yet.
 	// The goroutine's cleanup is the single source of truth for DB removal upon stopping.
 
-	logToClients("info", "Successfully signaled sniffing to stop on interface: %s. DB record will be removed by the sniffing goroutine.", req.InterfaceName)
+	logToClients("info", nil, "Successfully signaled sniffing to stop on interface: %s. DB record will be removed by the sniffing goroutine.", req.InterfaceName)
 	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"message": "Successfully signaled sniffing to stop on interface: " + req.InterfaceName})
 }
@@ -403,7 +406,7 @@ func getActiveInterfacesStatusHandler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	err := json.NewEncoder(w).Encode(activeInterfaceIDs)
 	if err != nil {
-		logToClients("error", "Error encoding active interface IDs to JSON: %v", err)
+		logToClients("error", nil, "Error encoding active interface IDs to JSON: %v", err)
 		http.Error(w, "Failed to encode active interfaces to JSON", http.StatusInternalServerError)
 		return
 	}
@@ -481,7 +484,7 @@ func addBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 	currentBlacklist[key] = struct{}{}
 	blacklistMutex.Unlock()
 
-	logToClients("info", "Added %s (%s) to blacklist via API", req.IPAddress, logMessagePort)
+	logToClients("info", nil, "Added %s (%s) to blacklist via API", req.IPAddress, logMessagePort)
 	w.WriteHeader(http.StatusCreated)
 }
 
@@ -536,26 +539,73 @@ func removeBlacklistHandler(w http.ResponseWriter, r *http.Request) {
 	delete(currentBlacklist, key)
 	blacklistMutex.Unlock()
 
-	logToClients("info", "Removed %s (%s) from blacklist via API", req.IPAddress, logMessagePort)
+	logToClients("info", nil, "Removed %s (%s) from blacklist via API", req.IPAddress, logMessagePort)
 	w.WriteHeader(http.StatusOK) // Or http.StatusNoContent
 }
 
-// logToClients sends a log entry to the global log channel.
-func logToClients(logType, format string, args ...interface{}) {
+import (
+	"database/sql"
+	"encoding/json"
+	"fmt"
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
+	"github.com/google/gopacket/pcap"
+	"github.com/gorilla/websocket"
+	"log"
+	"net"
+	"net/http"
+	"strings" // Added for string manipulation
+	"super_firewall/store"
+	"sync"
+	"time"
+)
+
+// ... (other structs remain the same)
+
+// DBLogContext holds structured data for DB logging.
+type DBLogContext struct {
+	IPAddress      string
+	PcapDeviceName string
+}
+
+// logToClients sends a log entry, optionally with context for DB logging.
+func logToClients(logType string, dbCtx *DBLogContext, format string, args ...interface{}) {
+	currentTime := time.Now()
 	msg := fmt.Sprintf(format, args...)
-	entry := LogEntry{
+
+	// Send to WebSocket clients
+	wsEntry := LogEntry{
 		Type:    logType,
 		Message: msg,
-		Time:    time.Now().Format("15:04:05"), // Format time for display
+		Time:    currentTime.Format("15:04:05"),
 	}
 	select {
-	case logChannel <- entry:
-		// Sent successfully
+	case logChannel <- wsEntry:
 	default:
-		// Channel is full, drop the log to avoid blocking.
-		log.Println("Warning: Log channel full, dropping log:", msg)
+		log.Println("Warning: Log channel full for WebSockets, dropping log:", msg)
 	}
-	log.Printf(format, args...) // Still log to console for debugging
+
+	// Log to console
+	log.Printf("[%s] %s", logType, msg)
+
+	// Store "connect" or "intercept" logs to database if context is provided
+	if DB != nil && (logType == "connect" || logType == "intercept") && dbCtx != nil && dbCtx.IPAddress != "" {
+		isIntercepted := (logType == "intercept")
+		dbEntry := store.PersistentLogEntry{
+			Timestamp:       currentTime,
+			IPAddress:       dbCtx.IPAddress,
+			IsIntercepted:   isIntercepted,
+			PcapDeviceName:  dbCtx.PcapDeviceName,
+			OriginalMessage: msg,
+		}
+		err := store.AddAccessLogEntry(DB, dbEntry)
+		if err != nil {
+			log.Printf("Error storing access log to DB: %v (Entry: %+v)", err, dbEntry)
+		}
+	} else if (logType == "connect" || logType == "intercept") && (dbCtx == nil || dbCtx.IPAddress == "") {
+		// Log a warning if we expected to save this log but context was missing/incomplete
+		log.Printf("Warning: DBLogContext missing or IPAddress empty for DB storage: [%s] %s", logType, msg)
+	}
 }
 
 // isInternalIP checks if the given IP address is an internal (private or loopback) IP.
@@ -579,7 +629,7 @@ func sendRstPacket(handle *pcap.Handle, incomingEth *layers.Ethernet, incomingIP
 
 	// 2. Create the IPv4 layer.
 	// The source IP is the original destination IP, and the destination is the original source IP.
-	ip := &layers.IPv4{
+	respIP := &layers.IPv4{ // Renamed to respIP to avoid confusion in logToClients context
 		Version:  4,
 		IHL:      5,
 		TTL:      64,
@@ -603,7 +653,7 @@ func sendRstPacket(handle *pcap.Handle, incomingEth *layers.Ethernet, incomingIP
 		DataOffset: 5, // Basic TCP header size
 	}
 	// Set the TCP checksum. This is important for the packet to be accepted.
-	err := tcp.SetNetworkLayerForChecksum(ip)
+	err := tcp.SetNetworkLayerForChecksum(respIP)
 	if err != nil {
 		return fmt.Errorf("failed to set network layer for checksum: %v", err)
 	}
@@ -615,7 +665,7 @@ func sendRstPacket(handle *pcap.Handle, incomingEth *layers.Ethernet, incomingIP
 		ComputeChecksums: true,
 		FixLengths:       true,
 	}
-	err = gopacket.SerializeLayers(buf, opts, eth, ip, tcp)
+	err = gopacket.SerializeLayers(buf, opts, eth, respIP, tcp)
 	if err != nil {
 		return fmt.Errorf("failed to serialize layers: %v", err)
 	}
@@ -625,7 +675,13 @@ func sendRstPacket(handle *pcap.Handle, incomingEth *layers.Ethernet, incomingIP
 		return fmt.Errorf("failed to send RST packet: %v", err)
 	}
 
-	logToClients("intercept", "Sent RST from %s:%d to %s:%d", ip.SrcIP, tcp.SrcPort, ip.DstIP, tcp.DstPort)
+	// For this specific log, the "source" of the event is the firewall sending an RST.
+	// The relevant "IPAddress" for our access/intercept log is incomingIP.SrcIP (the original SYN sender).
+	// PcapDeviceName is not directly available here, but could be passed into sendRstPacket if needed.
+	// However, the calling context in startSniffing already logs the primary intercept event with devName.
+	// This log is more of a confirmation of action.
+	// We can pass nil for dbCtx here, as the main interception is already logged with context.
+	logToClients("intercept", nil, "Sent RST from %s:%d to %s:%d", respIP.SrcIP, tcp.SrcPort, respIP.DstIP, tcp.DstPort)
 	return nil
 }
 
@@ -760,6 +816,13 @@ func main() {
 	}
 	log.Println("Active interfaces table created successfully.")
 
+	// Create access log table
+	err = store.CreateAccessLogTable(DB)
+	if err != nil {
+		log.Fatalf("Failed to create access_log table: %v", err)
+	}
+	log.Println("Access log table created successfully.")
+
 	log.Println("Database initialized.")
 
 	// Load blacklist entries
@@ -787,17 +850,17 @@ func main() {
 	if len(persistedInterfaces) > 0 {
 		log.Printf("Found %d persisted active interfaces. Attempting to restart sniffing on them...", len(persistedInterfaces))
 		for _, deviceName := range persistedInterfaces {
-			logToClients("info", "Attempting to restart sniffing on persisted interface: %s", deviceName)
+			logToClients("info", nil, "Attempting to restart sniffing on persisted interface: %s", deviceName)
 			if errSniff := startSniffing(deviceName); errSniff != nil {
-				logToClients("error", "Failed to restart sniffing on %s: %v. It might need to be manually re-selected or may no longer be available.", deviceName, errSniff)
+				logToClients("error", nil, "Failed to restart sniffing on %s: %v. It might need to be manually re-selected or may no longer be available.", deviceName, errSniff)
 				// If startup fails for a persisted interface, remove it from DB to avoid repeated failures.
 				if errDb := store.RemoveActiveInterface(DB, deviceName); errDb != nil {
-					logToClients("error", "Additionally, failed to remove problematic persisted interface %s from DB: %v", deviceName, errDb)
+					logToClients("error", nil, "Additionally, failed to remove problematic persisted interface %s from DB: %v", deviceName, errDb)
 				} else {
-					logToClients("info", "Problematic persisted interface %s removed from DB.", deviceName)
+					logToClients("info", nil, "Problematic persisted interface %s removed from DB.", deviceName)
 				}
 			} else {
-				logToClients("info", "Successfully restarted sniffing on persisted interface: %s", deviceName)
+				logToClients("info", nil, "Successfully restarted sniffing on persisted interface: %s", deviceName)
 				// No need to re-add to DB as it was already there.
 			}
 		}
@@ -863,10 +926,19 @@ func main() {
 			}
 		})
 
+		// Register handler for /api/logs/history
+		http.HandleFunc("/api/logs/history", func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodGet {
+				getAccessLogHistoryHandler(w, r)
+			} else {
+				http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			}
+		})
+
 		log.Println("Starting WebSocket and API server on :8080")
 		// Serve static files from a 'frontend/dist' directory (create this later)
-		http.Handle("/", http.FileServer(http.Dir("./frontend/dist")))
-		err := http.ListenAndServe(":8080", nil) // Ensure DB is accessible if handlers need it
+		http.Handle("/", http.FileServer(http.Dir("./vite-project/dist"))) // Adjusted path
+		err := http.ListenAndServe(":8080", nil)                             // Ensure DB is accessible if handlers need it
 		if err != nil {
 			log.Fatalf("HTTP server failed: %v", err)
 		}
@@ -877,4 +949,67 @@ func main() {
 	// wg.Wait() will allow the program to exit cleanly.
 	wg.Wait()
 	log.Println("HTTP server goroutine finished. Exiting.")
+}
+
+// AccessLogHistoryRecord represents a single aggregated record for the log history API.
+type AccessLogHistoryRecord struct {
+	IPAddress         string `json:"ip_address"`
+	LatestTime        string `json:"latest_time"` // Format as string for JSON
+	AccessCount       int    `json:"access_count"`
+	InterceptionCount int    `json:"interception_count"`
+}
+
+// getAccessLogHistoryHandler handles GET requests to /api/logs/history.
+func getAccessLogHistoryHandler(w http.ResponseWriter, r *http.Request) {
+	if DB == nil {
+		logToClients("error", nil, "Database connection is not initialized for /api/logs/history")
+		http.Error(w, "Database not available", http.StatusInternalServerError)
+		return
+	}
+
+	query := `
+		SELECT
+			ip_address,
+			MAX(timestamp) as latest_time,
+			SUM(CASE WHEN is_intercepted = 0 THEN 1 ELSE 0 END) as access_count,
+			SUM(CASE WHEN is_intercepted = 1 THEN 1 ELSE 0 END) as interception_count
+		FROM
+			access_logs
+		GROUP BY
+			ip_address
+		ORDER BY
+			latest_time DESC;
+	`
+	rows, err := DB.Query(query)
+	if err != nil {
+		logToClients("error", nil, "Error querying access log history: %v", err)
+		http.Error(w, "Failed to retrieve log history", http.StatusInternalServerError)
+		return
+	}
+	defer rows.Close()
+
+	var history []AccessLogHistoryRecord
+	for rows.Next() {
+		var record AccessLogHistoryRecord
+		var latestTimeDB time.Time // Scan into time.Time first
+		if err := rows.Scan(&record.IPAddress, &latestTimeDB, &record.AccessCount, &record.InterceptionCount); err != nil {
+			logToClients("error", nil, "Error scanning log history row: %v", err)
+			http.Error(w, "Failed to process log history", http.StatusInternalServerError)
+			return
+		}
+		record.LatestTime = latestTimeDB.Format(time.RFC3339) // Format for consistent JSON output
+		history = append(history, record)
+	}
+
+	if err = rows.Err(); err != nil {
+		logToClients("error", nil, "Error after iterating log history rows: %v", err)
+		http.Error(w, "Error processing log history results", http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(history); err != nil {
+		logToClients("error", nil, "Error encoding log history to JSON: %v", err)
+		http.Error(w, "Failed to encode log history to JSON", http.StatusInternalServerError)
+	}
 }

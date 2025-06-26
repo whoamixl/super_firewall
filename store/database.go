@@ -3,7 +3,17 @@ package store
 import (
 	"database/sql"
 	_ "github.com/mattn/go-sqlite3"
+	"time"
 )
+
+// PersistentLogEntry is for storing structured logs to the database.
+type PersistentLogEntry struct {
+	Timestamp       time.Time
+	IPAddress       string
+	IsIntercepted   bool
+	PcapDeviceName  string
+	OriginalMessage string
+}
 
 // BlacklistEntry represents an entry in the blacklist table.
 type BlacklistEntry struct {
@@ -113,6 +123,36 @@ func GetActiveInterfaces(db *sql.DB) ([]string, error) {
 		return nil, err
 	}
 	return interfaceNames, nil
+}
+
+// CreateAccessLogTable creates the access_logs table if it doesn't exist.
+func CreateAccessLogTable(db *sql.DB) error {
+	query := `
+	CREATE TABLE IF NOT EXISTS access_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		timestamp DATETIME NOT NULL,
+		ip_address TEXT NOT NULL,
+		is_intercepted BOOLEAN NOT NULL,
+		pcap_device_name TEXT,
+		original_message TEXT
+	);`
+	_, err := db.Exec(query)
+	return err
+}
+
+// AddAccessLogEntry adds a new log entry to the access_logs table.
+func AddAccessLogEntry(db *sql.DB, entry PersistentLogEntry) error {
+	query := `
+	INSERT INTO access_logs (timestamp, ip_address, is_intercepted, pcap_device_name, original_message)
+	VALUES (?, ?, ?, ?, ?);`
+	stmt, err := db.Prepare(query)
+	if err != nil {
+		return err
+	}
+	defer stmt.Close()
+
+	_, err = stmt.Exec(entry.Timestamp, entry.IPAddress, entry.IsIntercepted, entry.PcapDeviceName, entry.OriginalMessage)
+	return err
 }
 
 // GetBlacklistEntries retrieves all entries from the blacklist table.
